@@ -1,0 +1,11 @@
+#!/bin/bash
+# pdf-reader 演示：将 PDF 转换为 Markdown
+# 作为 Jupyter notebook 演示的补充方案
+set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+conda run --no-capture-output -n pdf_read python -u ../pdf_2_md_main.py "$SCRIPT_DIR/test_pdf_read_script.pdf"
+
+read -p "按回车键关闭终端窗口..."
+nohup bash -c 'sleep 0.3; osascript -e "tell application \"Terminal\" to close first window"' >/dev/null 2>&1 &
+exit 0

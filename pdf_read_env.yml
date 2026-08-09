@@ -1,0 +1,6 @@
+name: pdf_read
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+prefix: /Users/xukangdi/miniconda3/envs/pdf_read

@@ -14,15 +14,23 @@ def pdf_to_markdown(pdf_path: pathlib.Path, cwd_path=None):
         cwd_path = pathlib.Path(cwd_path)
     
 
-    temp_pdf_name = pdf_path.with_suffix('').name
-    if len(temp_pdf_name) > 15:
-        temp_pdf_name = temp_pdf_name[:15]
+    pdf_name_no_suffix = pdf_path.with_suffix('').name
+    pdf_parent_folder=pdf_path.parent
+    temp_pdf_name_len=15
+    while temp_pdf_name_len<=len(pdf_name_no_suffix):
+        # 创建临时PDF文件，避免原PDF文件被占用
+        temp_pdf_name = pdf_name_no_suffix[:temp_pdf_name_len]
+        temp_pdf_path = (cwd_path / temp_pdf_name).with_suffix('.pdf')
+        if not temp_pdf_path.exists():
+            shutil.copy2(str(pdf_path), str(temp_pdf_path))
+            break
+        temp_pdf_name_len += 1
+
+    # 创建图片保存文件夹，文件夹名为临时PDF文件名加上'_imgs'后缀
     image_folder_str = temp_pdf_name.replace(' ', '_') + '_imgs'
     image_folder_abs = cwd_path / image_folder_str
-
-    temp_pdf_path = (cwd_path / temp_pdf_name).with_suffix('.pdf')
-    shutil.copy2(str(pdf_path), str(temp_pdf_path))
-
+    image_folder_str=str(image_folder_abs)
+    
     print(f'正在解析PDF文件: {pdf_path}，图片保存目标路径: {image_folder_abs}，请稍候...', flush=True)
     try:
         md_text = pymupdf4llm.to_markdown(
@@ -33,17 +41,23 @@ def pdf_to_markdown(pdf_path: pathlib.Path, cwd_path=None):
     finally:
         if os.path.exists(str(temp_pdf_path)):
             os.remove(str(temp_pdf_path))
-
-    if not any(image_folder_abs.iterdir()):
-        shutil.rmtree(image_folder_abs)
-        print('该PDF中没有可提取的图片，未创建图片文件夹。', flush=True)
-        image_folder_abs = None
+    if image_folder_abs.exists():
+        has_img_flag=any(image_folder_abs.iterdir())
     else:
+        image_folder_abs.mkdir(parents=True, exist_ok=True)
+        has_img_flag=False
+
+    if has_img_flag:
         print(f'图片已保存至: {image_folder_abs}', flush=True)
         # 打印所有图片的文件名
         print('提取的图片文件名列表:')
         for img_file in sorted(image_folder_abs.iterdir()):
             print(f'  {img_file.name}', flush=True)
+    else:
+        shutil.rmtree(image_folder_abs)
+        print('该PDF中没有可提取的图片，未创建图片文件夹。', flush=True)
+        image_folder_abs = None
+        
 
     output_md = (cwd_path / pdf_path.name).with_suffix('.md')
     output_md.write_text(md_text, encoding='utf-8')

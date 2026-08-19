@@ -9,13 +9,21 @@ import sys
 def pdf_to_markdown(pdf_path: pathlib.Path, cwd_path=None):
     """将PDF转换为Markdown，提取图片，返回 (output_md, image_folder_abs)。"""
     if cwd_path is None:
-        cwd_path = pdf_path.parent # 默认为PDF文件所在目录，图库文件夹也就放在这
+        cwd_path = pathlib.Path.cwd() # 默认为当前工作目录，图库文件夹也就放在这
     else:
         cwd_path = pathlib.Path(cwd_path)
+
+    if not pdf_path.exists():
+        raise ValueError(f"输入文件{pdf_path}不存在")
+    if not pdf_path.name.lower().endswith('.pdf'):
+        raise ValueError(f"输入文件{pdf_path}必须是PDF格式")
     
+    if not cwd_path.exists():
+        raise ValueError(f"工作目录{cwd_path}不存在")
+    if not cwd_path.is_dir():
+        raise ValueError(f"工作目录{cwd_path}必须是一个文件夹")
 
     pdf_name_no_suffix = pdf_path.with_suffix('').name
-    pdf_parent_folder=pdf_path.parent
     temp_pdf_name_len=15
     while temp_pdf_name_len<=len(pdf_name_no_suffix):
         # 创建临时PDF文件，避免原PDF文件被占用
@@ -77,7 +85,8 @@ def cleanup(output_md, image_folder_abs):
 def main():   
     test_demo_name='test_pdf_read_script.pdf'
     pdf_path = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__).parent/test_demo_name 
-    output_md, image_folder_abs=pdf_to_markdown(pdf_path)
+    cwd_path = pathlib.Path(sys.argv[2]) if (len(sys.argv) >2 and sys.argv[2] != '') else None
+    output_md, image_folder_abs=pdf_to_markdown(pdf_path, cwd_path)
     if pdf_path.name == test_demo_name: 
         input("按回车键继续清理生成的Markdown文件和图片文件夹...")       
         cleanup(output_md, image_folder_abs)

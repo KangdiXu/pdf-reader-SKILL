@@ -4,7 +4,8 @@
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
-conda run --no-capture-output -n pdf_read python -u ../pdf_2_md_main.py "$SCRIPT_DIR/test_pdf_read_script.pdf"
+echo "当前工作目录: $SCRIPT_DIR"
+conda run --no-capture-output -n pdf_read python -u ../pdf_2_md_main.py "$SCRIPT_DIR/test_pdf_read_script.pdf" "" # 结果目标路径为空，输出给当前工作目录
 
 read -p "按回车键关闭终端窗口..."
 nohup bash -c 'sleep 0.3; osascript -e "tell application \"Terminal\" to close first window"' >/dev/null 2>&1 &

@@ -93,7 +93,8 @@ if conda env list 2>/dev/null | grep -q "^${ENV_NAME} \|^${ENV_NAME}\*\| ${ENV_N
     echo "✅ 环境 '$ENV_NAME' 已存在，跳过创建。"
 else
     echo "⚠️  环境 '$ENV_NAME' 不存在，正在从 pdf_read_env.yml 创建..."
-    conda env create -f "$YML_FILE"
+    # 显式按环境名创建，由当前设备的 conda 自行决定环境安装目录。
+    conda env create --name "$ENV_NAME" --file "$YML_FILE"
     echo "✅ 环境 '$ENV_NAME' 创建完成。"
 fi
 

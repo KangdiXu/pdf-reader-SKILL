@@ -70,7 +70,7 @@ for /f "tokens=1" %%E in ('call conda env list 2^>nul') do call :mark_env_if_mat
 if defined ENV_EXISTS goto :env_ready
 
 echo [提示] 环境 "%ENV_NAME%" 不存在，正在从 pdf_read_env.yml 创建...
-rem --name 会覆盖 yml 中由其他操作系统导出的 name/prefix，确保环境创建在本机。
+rem 显式按环境名创建，由当前设备的 conda 自行决定环境安装目录。
 call conda env create --name "%ENV_NAME%" --file "%YML_FILE%" -y
 if errorlevel 1 (
     echo [错误] 创建 conda 环境 "%ENV_NAME%" 失败。

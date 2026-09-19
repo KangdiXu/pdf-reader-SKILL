@@ -4,7 +4,7 @@
 # 1. 检查 conda 是否已安装
 # 2. 检查 pdf_read 环境是否存在，不存在则创建
 # 3. 对比 requirements.txt，安装缺失的第三方库
-# 4. 选择目标 AI agent，安装 skill 到对应目录
+# 4. 选择目标 AI agent，安装完整 skill 目录
 # ============================================================
 
 set -e
@@ -98,31 +98,11 @@ else
     echo "✅ 环境 '$ENV_NAME' 创建完成。"
 fi
 
-# ---- 3. 对比并安装缺失的第三方库 ----
+# ---- 3. 安装并校验第三方库 ----
 echo ""
-echo "[3/4] 对比第三方依赖..."
-
-INSTALLED=$(conda run -n "$ENV_NAME" pip freeze 2>/dev/null | sed 's/[<>=!].*//' | tr '[:upper:]' '[:lower:]' | sort -u)
-
-MISSING_PACKAGES=()
-while IFS= read -r line; do
-    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-    pkg_name=$(echo "$line" | sed 's/[<>=!].*//' | tr '[:upper:]' '[:lower:]' | xargs)
-    if ! echo "$INSTALLED" | grep -qx "$pkg_name"; then
-        MISSING_PACKAGES+=("$line")
-    fi
-done < "$REQUIREMENTS_FILE"
-
-if [ ${#MISSING_PACKAGES[@]} -eq 0 ]; then
-    echo "✅ 所有依赖已安装，无需额外操作。"
-else
-    echo "⚠️  以下 ${#MISSING_PACKAGES[@]} 个包缺失，正在安装："
-    for pkg in "${MISSING_PACKAGES[@]}"; do
-        echo "   - $pkg"
-    done
-    conda run -n "$ENV_NAME" pip install "${MISSING_PACKAGES[@]}"
-    echo "✅ 缺失依赖安装完成。"
-fi
+echo "[3/4] 安装并校验第三方依赖..."
+conda run --no-capture-output -n "$ENV_NAME" python -m pip install --requirement "$REQUIREMENTS_FILE"
+conda run -n "$ENV_NAME" python -c "import pymupdf4llm; print('✅ pymupdf4llm', pymupdf4llm.__version__)"
 
 # ---- 4. 选择 agent 并安装 skill ----
 echo ""
@@ -188,25 +168,14 @@ else
     fi
 fi
 
-# 复制 skill 文件（只复制必要的两个文件）
+# 复制运行时所需的 skill 文件。测试、演示和安装文件不复制。
 mkdir -p "$SKILL_TARGET"
 cp "$SKILL_SOURCE/pdf_2_md_main.py" "$SKILL_TARGET/"
 cp "$SKILL_SOURCE/SKILL.md" "$SKILL_TARGET/"
-
-# 将 pdf_2_md_main.py 的实际路径写入 SKILL.md 中
-# 在第一个 "### 0. 环境准备" 的下一行开始，依次写入标题和路径
-PY_SCRIPT_PATH="$SKILL_TARGET/pdf_2_md_main.py"
-awk -v py_path="$PY_SCRIPT_PATH" '
-  /^### 0\. 环境准备/ && !done {
-    print $0
-    print ""
-    print "**0a. skill 核心python脚本的路径**"
-    print "AGENT_SKILL_py_PATH=" py_path
-    done=1
-    next
-  }
-  { print }
-' "$SKILL_TARGET/SKILL.md" > "$SKILL_TARGET/SKILL.md.tmp" && mv "$SKILL_TARGET/SKILL.md.tmp" "$SKILL_TARGET/SKILL.md"
+cp "$SKILL_SOURCE/README.md" "$SKILL_TARGET/"
+mkdir -p "$SKILL_TARGET/scripts" "$SKILL_TARGET/references"
+cp "$SKILL_SOURCE/scripts/extract_pdf.py" "$SKILL_TARGET/scripts/"
+cp "$SKILL_SOURCE/references/ocr.md" "$SKILL_TARGET/references/"
 echo ""
 echo "=========================================="
 echo "  ✅ pdf_read 环境准备就绪！"

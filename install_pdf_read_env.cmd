@@ -193,13 +193,16 @@ copy /Y "%SCRIPT_DIR%pdf_2_md_main.py" "%SKILL_TARGET%\pdf_2_md_main.py" >nul
 if errorlevel 1 goto :copy_failed
 copy /Y "%SCRIPT_DIR%SKILL.md" "%SKILL_TARGET%\SKILL.md" >nul
 if errorlevel 1 goto :copy_failed
-
-set "PY_SCRIPT_PATH=%SKILL_TARGET%\pdf_2_md_main.py"
-call conda run -n "%ENV_NAME%" python -c "from pathlib import Path; import sys; p=Path(sys.argv[1]); s=p.read_text(encoding='utf-8'); marker='### 0. 环境准备'; insert=marker+'\n\n**0a. skill 核心python脚本的路径**\nAGENT_SKILL_py_PATH='+sys.argv[2]; assert marker in s, 'SKILL.md 中缺少环境准备标记'; p.write_text(s.replace(marker, insert, 1), encoding='utf-8')" "%SKILL_TARGET%\SKILL.md" "%PY_SCRIPT_PATH%"
-if errorlevel 1 (
-    echo [错误] 无法将核心 Python 脚本路径写入 SKILL.md。
-    goto :failed
-)
+copy /Y "%SCRIPT_DIR%README.md" "%SKILL_TARGET%\README.md" >nul
+if errorlevel 1 goto :copy_failed
+mkdir "%SKILL_TARGET%\scripts"
+if errorlevel 1 goto :copy_failed
+mkdir "%SKILL_TARGET%\references"
+if errorlevel 1 goto :copy_failed
+copy /Y "%SCRIPT_DIR%scripts\extract_pdf.py" "%SKILL_TARGET%\scripts\extract_pdf.py" >nul
+if errorlevel 1 goto :copy_failed
+copy /Y "%SCRIPT_DIR%references\ocr.md" "%SKILL_TARGET%\references\ocr.md" >nul
+if errorlevel 1 goto :copy_failed
 
 echo.
 echo ==========================================

@@ -1,59 +1,77 @@
 ---
 name: pdf-reader
-description: "When user asks to read, extract text, or analyze a paper, an article, a guidebook, etc., generally belonging to a PDF file, this skill should be used. It activates a dedicated conda environment 'pdf_read' and uses PyMuPDF4LLM to process the file."
+description: Transfer local PDFs to page-aware Markdown, or read and analyze them after transfer, with selective OCR, optional images, explicit output folders, and source-based duplicate detection. Use for papers, reports, books, manuals, scanned PDFs, and pdf-reader usage questions; do not use for creating or editing PDFs.
 ---
 
-# PDF阅读专家
+# PDF Reader
 
-## 核心工作流
-当被触发时，严格按以下步骤操作：
+Use `scripts/extract_pdf.py`, resolved relative to this `SKILL.md`. Run it through the `pdf_read` environment. Do not copy the source PDF or load an entire long document into model context unless the task requires it.
 
-### 0. 环境准备
+## Usage questions
 
+When the user asks how to use `pdf-reader`, which options to choose, what it outputs, or requests usage examples, read [README.md](README.md) completely and answer from it. Treat the README as the canonical usage guide; do not invent commands or options that are not documented there.
 
+## Request format
 
-*上方空白插入python脚本路径*
+When suggesting how to invoke this skill, prefer a short parameter block so omitted choices are visible:
 
-`AGENT_SKILL_py_PATH` 是把**pdf转换为markdown的关键python脚本**的绝对路径，后面运行脚本时需要用到，非常重要。
-
-在首次使用或遇到环境问题时，依次执行以下检查：
-
-**0b. 检查 conda 环境是否存在**
-
-```bash
-conda env list | grep pdf_read 
-```
-如果存在问题，如conda指令无效、 `pdf_read` 环境不存在（`grep` 未匹配到），则停止处理对话内容，立刻向用户提示出现的问题，并告诉用户可行的解决方法。
-
-### 1. 确认文件
-获取用户提供的**PDF文件路径**或**macOS系统替身文件路径**。将 `INSERT_PDF_PATH_HERE` 直接替换为用户输入的要求阅读的PDF文件的**绝对路径**，运行python脚本。
-
-### 2. 执行分析
-使用以下命令在 `pdf_read` 环境中运行Python脚本，提取文字和图片。
-
-### 3. 返回结果
-将提取的Markdown文本和图片信息呈现给用户，并提示图片已保存的位置。
-
-## 执行命令模板
-下面是用于将**pdf转化为markdown的核心命令**。请**务必在当前对话的工作目录下**，创建一个子Shell命令完成环境激活和脚本执行。
-
-```bash
-AGENT_SKILL_py_PATH="/path/of/SKILL/py/script" # py脚本绝对路径在0.a部分已经给出
-INSERT_PDF_PATH_HERE="/path/of/pdf/to/transfer" # 要转换的pdf的路径
-OPTIONAL_RESULT_FOLDER="/path/of/results/output" # 转换得到的markdown和图片文件夹放置的文件夹路径，默认为当前工作目录
-conda run --no-capture-output -n pdf_read python "$AGENT_SKILL_py_PATH" "$INSERT_PDF_PATH_HERE" "$OPTIONAL_RESULT_FOLDER"
+```text
+Action: <transfer / read>
+Object: <a PDF file or a directory>
+Pages: <whole document / page range>
+Images: <no / selected / all>
+OCR: <auto / off / force>
+OCR language: <eng / chi_sim+eng / other installed languages>
+Duplicate handling: <default / ignore duplicates, must transfer>
 ```
 
-**需要注意：**
+Such a short parameter block can also be expressed in sentence or prose, e.g., "Extract pages 12–18 with selected images and OCR forced in English." or "阅读这篇文献，全文，不生成图片，不使用 OCR". The user may also provide a `--output-dir` path. If omitted, the script uses a predictable default output folder.
 
-- 把`AGENT_SKILL_py_PATH` 替换为当前AI-agent所用skill中的核心python脚本的绝对路径，`AGENT_SKILL_py_PATH` 使用的路径已经写在了本文档的 **0a. skill 核心python脚本的路径** 部分。
+The user may add `任务` and `输出目录`. Accept equivalent prose; do not require exact wording. Map `全文` to all pages, `不生成图片` to `--images none`, `不使用 OCR` to `--ocr off`, and so on. Put any force directive last when suggesting a request. Map phrases such as `忽略重复`, `必须转换`, `强制转换`, or `重新转换` to `--reconvert` (or its alias `--force`).
 
-- 把 `INSERT_PDF_PATH_HERE` 替换为用户输入的要求阅读的PDF文件的**绝对路径**
-- `OPTIONAL_RESULT_FOLDER` 是转换得到的markdown和图片文件夹放置的文件夹路径。**要关注用户命令中，关于转换后输出的文件放置路径的描述**。如果用户没有特殊要求就是**空字符**，python脚本会把转换结果放到**默认路径也就是当前工作目录**。
-- 输入路径 `AGENT_SKILL_py_PATH`  、 `INSERT_PDF_PATH_HERE`  和`OPTIONAL_RESULT_FOLDER` 都是终端变量他们两边的英文双引号**必须**有，这样才能保证文件的路径即使有空格或者其他特殊的符号，也能正常运行python脚本，也是终端指令常用的格式，保证把**完整的、正确的字符串**传入到`pdf_2_md_main.py` 脚本
+## Transfer and read
 
-### 4. 其他注意事项
+- **Transfer (`转换`, `transfer`)** means creating Markdown and related files only. Run `scripts/extract_pdf.py transfer ...` and report the result paths; do not interpret, summarize, search, or analyze the generated content. `pdf_2_md_main.py` is a backward-compatible wrapper for the same extractor, not a second conversion step. Never run both entry points for one PDF.
+- **Read (`阅读`, `read`)** means ensuring a transferred result exists and then analyzing the generated Markdown, page files, and requested images to answer the user's question. Reading therefore includes transfer when no reusable result exists.
+- If the wording is only “转换为 Markdown” or “导出 Markdown”, choose transfer. If it asks to read, summarize, search, compare, extract facts, or explain content, choose read.
 
-- skill运行过程中遇到python程序报错，立即结束当前将pdf转换为markdown的工作流，转向思考为什么会出错、SKILL 中的 `pdf_2_md_main.py ` 哪里有问题。
+## Workflow
 
-  
+1. Resolve the supplied path and mode. For a directory, process every PDF directly inside it by default; include nested directories only when the user asks. Handle each PDF separately.
+2. Before inspecting or validating requested extraction parameters, check the conversion registry by the absolute `source` path. If a valid result for that source exists, do not transfer again, even when the requested pages, images, OCR settings, output path, source modification time, or parser version differ. Report and use the registered result. Only a user force phrase or an explicit `--reconvert` / `--force` bypasses this rule.
+3. For a new or forced transfer, choose the requested extraction behavior:
+   - For a short document or whole-document summary, extract all pages without images.
+   - For a long document or a focused question, extract only the relevant page range. If the relevant pages are unknown, use the table of contents or extract text-only page files, search them with `rg`, and read only the matches plus nearby pages.
+   - Request images only when the task depends on figures, formulas, diagrams, or layout. Use `--images selected` with `--pages` whenever possible.
+4. Keep `--ocr auto` unless the document is known to have usable native text (`--ocr off`) or is a scan that needs OCR on every selected page (`--ocr force`). For non-English scans, choose an installed OCR language. Read [references/ocr.md](references/ocr.md) only when OCR fails or language setup is relevant.
+5. Write a new result directly to the requested `--output-dir`. Without one, use `<PDF文件名>-<source短标识>-pdf-reader-output` in the current working directory. The combined Markdown is named `<PDF文件名>.md`. For directory input, use one output subfolder per PDF.
+6. In transfer mode, stop after reporting generated or reused paths. In read mode, read generated files selectively, answer the user's question, and cite PDF page numbers. If a source-only duplicate lacks the pages or images needed for the requested analysis, explain that a forced transfer is required; do not force it implicitly.
+
+## Commands
+
+Set the script path from this skill's directory, then run:
+
+```bash
+conda run --no-capture-output -n pdf_read python "/absolute/path/to/pdf-reader/scripts/extract_pdf.py" inspect "/absolute/path/input.pdf"
+```
+
+Transfer with page-aware output:
+
+```bash
+conda run --no-capture-output -n pdf_read python "/absolute/path/to/pdf-reader/scripts/extract_pdf.py" transfer "/absolute/path/input.pdf" --output-dir "/absolute/path/output"
+```
+
+Focused extraction with figures:
+
+```bash
+conda run --no-capture-output -n pdf_read python "/absolute/path/to/pdf-reader/scripts/extract_pdf.py" extract "/absolute/path/input.pdf" --output-dir "/absolute/path/output" --pages "12-18" --images selected
+```
+
+The command prints a compact JSON result. The specified output folder contains source-named Markdown, optional `pages/`, optional `images/`, and `manifest.json`. By default, `pdf-reader-conversions.json` is stored beside the source PDF so the same source is recognized across requested output locations. Re-running a registered source returns `status: already_converted` regardless of parameters. Use `--reconvert` or `--force` only for an explicit force request. Image filenames are not printed unless `--verbose` is used.
+
+## Failure handling
+
+- If the command cannot import its dependencies, then check whether the `pdf_read` environment exists. Do not run an environment inventory before every successful extraction.
+- If auto OCR gives poor results and the user asks to redo it, retry only the affected pages with `--ocr force`, an appropriate `--ocr-language`, and `--reconvert`.
+- If the registry entry exists but its output folder or manifest is missing or inconsistent, do not reuse it; regenerate or report a protected-output conflict.
+- If extraction fails, report the failing command and error. Do not silently fall back to an unverified full-document conversion.

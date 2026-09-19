@@ -3,3 +3,6 @@ channels:
   - defaults
 dependencies:
   - python=3.12
+  - pip
+  - pip:
+      - pymupdf4llm==1.27.2.2

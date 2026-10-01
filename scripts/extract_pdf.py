@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import quote
 
 import pymupdf
 import pymupdf4llm
@@ -25,6 +26,8 @@ SCANNED_TEXT_THRESHOLD = 40
 MANIFEST_SCHEMA_VERSION = 6
 REGISTRY_SCHEMA_VERSION = 1
 REGISTRY_FILENAME = "pdf-reader-conversions.json"
+MARKDOWN_IMAGE_OPEN_RE = re.compile(r"!\[[^\]\n]*\]\(")
+IGNORED_OUTPUT_FILE_NAMES = {".DS_Store"}
 
 
 def validate_pdf(value: str | Path) -> Path:
@@ -181,16 +184,123 @@ def convert_pages(
     return chunks
 
 
-def portable_markdown(text: str, image_dir: Path) -> str:
-    """Replace temporary absolute image paths with portable relative links."""
-    replacements = {
-        str(image_dir): "images",
-        image_dir.as_posix(): "images",
-        str(image_dir).replace("\\", "/"): "images",
+def markdown_unescape(value: str) -> str:
+    return re.sub(r"\\([\\`*_{}\[\]()#+\-.!])", r"\1", value)
+
+
+def markdown_filename_variants(filename: str) -> set[str]:
+    escaped = re.sub(r"([\\`*_{}\[\]()#+\-.!])", r"\\\1", filename)
+    return {
+        filename,
+        filename.replace("_", r"\_"),
+        escaped,
+        quote(filename),
     }
-    for source, target in replacements.items():
-        text = text.replace(source, target)
-    return text.strip() + "\n"
+
+
+def markdown_image_target_bounds(
+    line: str,
+    target_start: int,
+) -> tuple[int, int, int] | None:
+    """Return searchable target bounds and the link-closing parenthesis."""
+    if target_start >= len(line):
+        return None
+
+    if line[target_start] == "<":
+        index = target_start + 1
+        while index < len(line):
+            if line[index] == "\\":
+                index += 2
+                continue
+            if line[index] == ">":
+                closing = line.find(")", index + 1)
+                if closing >= 0:
+                    return target_start + 1, index, closing
+                return None
+            index += 1
+        return None
+
+    depth = 0
+    index = target_start
+    while index < len(line):
+        if line[index] == "\\":
+            index += 2
+            continue
+        if line[index] == "(":
+            depth += 1
+        elif line[index] == ")":
+            if depth == 0:
+                return target_start, index, index
+            depth -= 1
+        index += 1
+    return None
+
+
+def rewrite_image_links_in_line(
+    line: str,
+    image_names: set[str],
+    image_prefix: str,
+) -> str:
+    search_from = 0
+    while True:
+        opening = MARKDOWN_IMAGE_OPEN_RE.search(line, search_from)
+        if not opening:
+            return line
+
+        target_start = opening.end()
+        bounds = markdown_image_target_bounds(line, target_start)
+        if not bounds:
+            search_from = target_start
+            continue
+        searchable_start, searchable_end, closing = bounds
+
+        candidates: list[tuple[int, str, str]] = []
+        for filename in image_names:
+            for variant in markdown_filename_variants(filename):
+                index = line.find(variant, searchable_start, searchable_end)
+                if index < 0:
+                    continue
+                target_prefix = markdown_unescape(
+                    line[searchable_start:index]
+                ).replace("\\", "/")
+                if "images/" in target_prefix:
+                    candidates.append((index, filename, variant))
+
+        if not candidates:
+            search_from = target_start
+            continue
+
+        filename = min(
+            candidates,
+            key=lambda candidate: (candidate[0], -len(candidate[2])),
+        )[1]
+        portable_target = f"{image_prefix.rstrip('/')}/{filename}"
+        if any(character.isspace() for character in portable_target) or any(
+            character in portable_target for character in "()"
+        ):
+            portable_target = f"<{portable_target}>"
+        line = f"{line[:target_start]}{portable_target}{line[closing:]}"
+        search_from = target_start + len(portable_target) + 1
+
+
+def portable_markdown(
+    text: str,
+    image_dir: Path,
+    *,
+    image_prefix: str = "images",
+) -> str:
+    """Rewrite generated image links so no temporary path survives."""
+    image_names = (
+        {item.name for item in image_dir.iterdir() if item.is_file()}
+        if image_dir.exists()
+        else set()
+    )
+
+    rewritten = "".join(
+        rewrite_image_links_in_line(line, image_names, image_prefix)
+        for line in text.splitlines(keepends=True)
+    )
+    return rewritten.strip() + "\n"
 
 
 def resolve_output_dir(pdf_path: Path, value: str | None) -> Path:
@@ -224,7 +334,7 @@ def validate_replaceable_output(target: Path) -> dict[str, Any] | None:
     actual_files = {
         item.relative_to(target).as_posix()
         for item in target.rglob("*")
-        if item.is_file()
+        if item.is_file() and item.name not in IGNORED_OUTPUT_FILE_NAMES
     }
     actual_dirs = {
         item.relative_to(target).as_posix()
@@ -308,6 +418,34 @@ def manifest_markdown_path(output_dir: Path, manifest: dict[str, Any]) -> Path:
     raise ValueError(f"manifest.json 未记录合并 Markdown: {output_dir}")
 
 
+def repair_output_image_links(output_dir: Path, manifest: dict[str, Any]) -> int:
+    """Repair temporary image paths in an otherwise valid existing result."""
+    image_dir = output_dir / "images"
+    if not image_dir.is_dir():
+        return 0
+
+    markdown_files = [(manifest_markdown_path(output_dir, manifest), "images")]
+    page_dir = output_dir / "pages"
+    if page_dir.is_dir():
+        markdown_files.extend(
+            (page_path, "../images")
+            for page_path in sorted(page_dir.glob("*.md"))
+        )
+
+    repaired = 0
+    for markdown_path, image_prefix in markdown_files:
+        original = markdown_path.read_text(encoding="utf-8")
+        normalized = portable_markdown(
+            original,
+            image_dir,
+            image_prefix=image_prefix,
+        )
+        if normalized != original:
+            markdown_path.write_text(normalized, encoding="utf-8")
+            repaired += 1
+    return repaired
+
+
 def find_registered_conversion(
     registry: dict[str, Any], pdf_path: Path
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
@@ -320,6 +458,7 @@ def find_registered_conversion(
         except (OSError, ValueError):
             continue
         if manifest and same_source(manifest.get("source"), pdf_path):
+            repair_output_image_links(output_dir, manifest)
             return entry, manifest
     return None
 
@@ -379,6 +518,7 @@ def extract_document(args: argparse.Namespace) -> dict[str, Any]:
         existing_manifest = validate_replaceable_output(target)
     if not registered and not args.reconvert and existing_manifest:
         if same_source(existing_manifest.get("source"), pdf_path):
+            repair_output_image_links(target, existing_manifest)
             stat = pdf_path.stat()
             registered_parameters = existing_manifest.get("parameters") or {}
             conversion_id = source_key(pdf_path)
@@ -503,10 +643,23 @@ def extract_document(args: argparse.Namespace) -> dict[str, Any]:
             page_dir.mkdir()
         for chunk in chunks:
             number = page_number(chunk)
-            text = portable_markdown(chunk.get("text", ""), image_dir)
-            document_parts.append(f"<!-- page: {number} -->\n\n{text}")
+            raw_text = chunk.get("text", "")
+            document_text = portable_markdown(
+                raw_text,
+                image_dir,
+                image_prefix="images",
+            )
+            page_text = portable_markdown(
+                raw_text,
+                image_dir,
+                image_prefix="../images",
+            )
+            document_parts.append(f"<!-- page: {number} -->\n\n{document_text}")
             if not args.no_page_files:
-                (page_dir / f"{number:04d}.md").write_text(text, encoding="utf-8")
+                (page_dir / f"{number:04d}.md").write_text(
+                    page_text,
+                    encoding="utf-8",
+                )
 
         markdown_name = markdown_filename(pdf_path)
         document_path = temp_path / markdown_name

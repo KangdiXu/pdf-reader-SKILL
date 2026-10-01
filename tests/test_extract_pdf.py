@@ -26,6 +26,131 @@ class ExtractPdfTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             extract_pdf.parse_pages("4-2", 5)
 
+    def test_image_links_are_rewritten_out_of_temporary_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            temp_path = Path(parent) / ".report-random"
+            image_dir = temp_path / "images"
+            image_dir.mkdir(parents=True)
+            image_name = "report_file.pdf-0003-04.png"
+            (image_dir / image_name).write_bytes(b"image")
+            raw = (
+                "before\n"
+                f"![](repo/{temp_path.name}/images/{image_name})\n"
+                "after\n"
+            )
+
+            document = extract_pdf.portable_markdown(
+                raw,
+                image_dir,
+                image_prefix="images",
+            )
+            page = extract_pdf.portable_markdown(
+                raw,
+                image_dir,
+                image_prefix="../images",
+            )
+
+            self.assertIn(f"![](images/{image_name})", document)
+            self.assertIn(f"![](../images/{image_name})", page)
+            self.assertNotIn(temp_path.name, document)
+            self.assertNotIn(temp_path.name, page)
+
+    def test_image_link_rewrite_handles_markdown_escaped_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            image_dir = Path(parent) / "images"
+            image_dir.mkdir()
+            image_name = "name_with_underscores.png"
+            (image_dir / image_name).write_bytes(b"image")
+            raw = r"![](.temporary/images/name\_with\_underscores.png)"
+            result = extract_pdf.portable_markdown(raw, image_dir)
+            self.assertEqual(result, f"![](images/{image_name})\n")
+
+    def test_image_link_rewrite_handles_complex_names_and_multiple_links(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            image_dir = Path(parent) / "images"
+            image_dir.mkdir()
+            first_name = "figure (draft)_一.png"
+            second_name = "plain-image.png"
+            (image_dir / first_name).write_bytes(b"first")
+            (image_dir / second_name).write_bytes(b"second")
+            raw = (
+                f"![](<repo/.temporary/images/{first_name}>) "
+                f"![](repo/.temporary/images/{second_name})"
+            )
+
+            result = extract_pdf.portable_markdown(raw, image_dir)
+
+            self.assertEqual(
+                result,
+                (
+                    f"![](<images/{first_name}>) "
+                    f"![](images/{second_name})\n"
+                ),
+            )
+
+    def test_image_link_rewrite_does_not_cross_an_unrelated_link(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            image_dir = Path(parent) / "images"
+            image_dir.mkdir()
+            image_name = "generated.png"
+            (image_dir / image_name).write_bytes(b"image")
+            raw = (
+                "![](https://example.com/external.png) "
+                f"![](repo/.temporary/images/{image_name})"
+            )
+
+            result = extract_pdf.portable_markdown(raw, image_dir)
+
+            self.assertEqual(
+                result,
+                (
+                    "![](https://example.com/external.png) "
+                    f"![](images/{image_name})\n"
+                ),
+            )
+
+    def test_image_link_rewrite_handles_url_encoded_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            image_dir = Path(parent) / "images"
+            image_dir.mkdir()
+            image_name = "figure one.png"
+            (image_dir / image_name).write_bytes(b"image")
+            raw = "![](repo/.temporary/images/figure%20one.png)"
+
+            result = extract_pdf.portable_markdown(raw, image_dir)
+
+            self.assertEqual(result, f"![](<images/{image_name}>)\n")
+
+    def test_existing_output_image_links_are_repaired_without_conversion(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            output_dir = Path(parent) / "result"
+            image_dir = output_dir / "images"
+            page_dir = output_dir / "pages"
+            image_dir.mkdir(parents=True)
+            page_dir.mkdir()
+            image_name = "report.pdf-0003-04.png"
+            (image_dir / image_name).write_bytes(b"image")
+            broken = f"![](repo/.report-random/images/{image_name})\n"
+            combined = output_dir / "report.md"
+            page = page_dir / "0003.md"
+            combined.write_text(broken, encoding="utf-8")
+            page.write_text(broken, encoding="utf-8")
+
+            repaired = extract_pdf.repair_output_image_links(
+                output_dir,
+                {"markdown_file": "report.md"},
+            )
+
+            self.assertEqual(repaired, 2)
+            self.assertEqual(
+                combined.read_text(encoding="utf-8"),
+                f"![](images/{image_name})\n",
+            )
+            self.assertEqual(
+                page.read_text(encoding="utf-8"),
+                f"![](../images/{image_name})\n",
+            )
+
     def test_inspect_demo(self) -> None:
         result = extract_pdf.inspect_document(DEMO_PDF.resolve())
         self.assertEqual(result["page_count"], 3)
@@ -173,6 +298,29 @@ class ExtractPdfTests(unittest.TestCase):
             self.assertTrue(registry_path.is_file())
             registry = json.loads(registry_path.read_text(encoding="utf-8"))
             self.assertEqual(len(registry["conversions"]), 1)
+
+    def test_macos_metadata_does_not_block_existing_output_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            output_dir = Path(parent) / "result"
+            args = argparse.Namespace(
+                pdf=str(DEMO_PDF),
+                output_dir=str(output_dir),
+                registry_file=str(Path(parent) / "registry.json"),
+                reconvert=False,
+                pages="1",
+                images="none",
+                ocr="off",
+                ocr_language="eng",
+                no_page_files=False,
+                verbose=False,
+            )
+            extract_pdf.extract_document(args)
+            (output_dir / ".DS_Store").write_bytes(b"Finder metadata")
+
+            result = extract_pdf.extract_document(args)
+
+            self.assertTrue(result["already_converted"])
+            self.assertTrue((output_dir / ".DS_Store").is_file())
 
     def test_different_parameters_are_ignored_unless_forced(self) -> None:
         with tempfile.TemporaryDirectory() as parent:

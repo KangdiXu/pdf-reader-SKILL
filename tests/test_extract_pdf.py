@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -19,6 +20,30 @@ spec.loader.exec_module(extract_pdf)
 
 
 class ExtractPdfTests(unittest.TestCase):
+    @staticmethod
+    def make_hidden_ocr_pdf(path: Path) -> str:
+        hidden_text = "Hidden OCR body text for quality fallback. " * 8
+        document = extract_pdf.pymupdf.open()
+        page = document.new_page(width=300, height=400)
+        pixmap = extract_pdf.pymupdf.Pixmap(
+            extract_pdf.pymupdf.csGRAY,
+            extract_pdf.pymupdf.IRect(0, 0, 30, 40),
+            False,
+        )
+        pixmap.clear_with(240)
+        page.insert_image(page.rect, stream=pixmap.tobytes("png"))
+        page.insert_text(
+            (20, 40),
+            hidden_text,
+            fontsize=9,
+            render_mode=3,
+            fill_opacity=0,
+        )
+        page.insert_text((5, 390), "note", fontsize=6)
+        document.save(path)
+        document.close()
+        return hidden_text
+
     def test_parse_pages(self) -> None:
         self.assertEqual(extract_pdf.parse_pages("1-2,2,4", 5), [0, 1, 3])
         with self.assertRaises(ValueError):
@@ -156,19 +181,255 @@ class ExtractPdfTests(unittest.TestCase):
         self.assertEqual(result["page_count"], 3)
         self.assertGreater(result["text_chars"], 0)
 
-    def test_default_names_are_source_based(self) -> None:
+    def test_inspect_detects_transparent_ocr_page(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            pdf_path = Path(parent) / "hidden-ocr.pdf"
+            self.make_hidden_ocr_pdf(pdf_path)
+
+            result = extract_pdf.inspect_document(pdf_path.resolve())
+            page = result["pages"][0]
+
+            self.assertEqual(result["hidden_ocr_pages"], [1])
+            self.assertEqual(result["likely_scanned_pages"], [1])
+            self.assertTrue(page["hidden_ocr_page"])
+            self.assertGreater(page["transparent_text_chars"], 40)
+            self.assertGreater(page["bboxlog"]["ignore_text"], 0)
+            self.assertGreater(page["bboxlog"]["fill_image"], 0)
+            self.assertGreater(page["largest_image_area_ratio"], 0.9)
+
+    def test_low_layout_output_falls_back_to_native_text(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            pdf_path = Path(parent) / "hidden-ocr.pdf"
+            self.make_hidden_ocr_pdf(pdf_path)
+            inspection = extract_pdf.inspect_document(pdf_path.resolve())
+            chunks = [{"metadata": {"page_number": 1}, "text": "note"}]
+
+            with mock.patch.object(extract_pdf, "raster_ocr_page") as raster_ocr:
+                verified, records = extract_pdf.extract_page_content(
+                    pdf_path.resolve(),
+                    [0],
+                    chunks,
+                    inspection,
+                    ocr_mode="auto",
+                    ocr_language="eng",
+                )
+
+            raster_ocr.assert_not_called()
+            self.assertIn("Hidden OCR body text", verified[0]["text"])
+            self.assertEqual(records[0]["backend"], "pymupdf_native_text")
+            self.assertEqual(
+                records[0]["fallback_reason"],
+                "hidden_ocr_page_prefers_native_text",
+            )
+            self.assertTrue(records[0]["hidden_ocr_page"])
+            self.assertTrue(records[0]["quality_passed"])
+
+    def test_quality_gate_falls_back_on_a_normal_text_page(self) -> None:
+        inspection = extract_pdf.inspect_document(DEMO_PDF.resolve())
+        chunks = [{"metadata": {"page_number": 1}, "text": ""}]
+
+        verified, records = extract_pdf.extract_page_content(
+            DEMO_PDF.resolve(),
+            [0],
+            chunks,
+            inspection,
+            ocr_mode="off",
+            ocr_language="eng",
+        )
+
+        self.assertGreater(extract_pdf.markdown_body_char_count(verified[0]["text"]), 40)
+        self.assertEqual(records[0]["backend"], "pymupdf_native_text")
+        self.assertEqual(
+            records[0]["fallback_reason"],
+            "pymupdf4llm_output_below_native_text_ratio",
+        )
+        self.assertTrue(records[0]["quality_passed"])
+
+    def test_force_ocr_uses_independent_raster_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            pdf_path = Path(parent) / "hidden-ocr.pdf"
+            self.make_hidden_ocr_pdf(pdf_path)
+            inspection = extract_pdf.inspect_document(pdf_path.resolve())
+            chunks = [{"metadata": {"page_number": 1}, "text": "baseline"}]
+            ocr_text = "Raster OCR output with enough body text to pass quality. " * 3
+
+            with mock.patch.object(
+                extract_pdf,
+                "raster_ocr_page",
+                return_value=ocr_text,
+            ) as raster_ocr:
+                verified, records = extract_pdf.extract_page_content(
+                    pdf_path.resolve(),
+                    [0],
+                    chunks,
+                    inspection,
+                    ocr_mode="force",
+                    ocr_language="eng",
+                )
+
+            raster_ocr.assert_called_once()
+            self.assertIn("Raster OCR output", verified[0]["text"])
+            self.assertEqual(records[0]["backend"], "tesseract_raster_ocr")
+            self.assertEqual(records[0]["fallback_reason"], "ocr_force")
+
+    def test_legacy_empty_result_is_not_reusable_when_native_text_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            pdf_path = root / "hidden-ocr.pdf"
+            self.make_hidden_ocr_pdf(pdf_path)
+            output_dir = root / "result"
+            page_dir = output_dir / "pages"
+            page_dir.mkdir(parents=True)
+            (page_dir / "0001.md").write_text("\n", encoding="utf-8")
+            manifest = {
+                "parameters": {"pages": [1]},
+                "markdown_file": "hidden-ocr.md",
+            }
+
+            self.assertFalse(
+                extract_pdf.registered_output_quality_is_valid(
+                    output_dir,
+                    manifest,
+                    pdf_path.resolve(),
+                )
+            )
+
+    def test_registered_legacy_empty_result_is_regenerated(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            pdf_path = root / "hidden-ocr.pdf"
+            self.make_hidden_ocr_pdf(pdf_path)
+            pdf_path = pdf_path.resolve()
+            output_dir = root / "result"
+            page_dir = output_dir / "pages"
+            page_dir.mkdir(parents=True)
+            markdown_name = "hidden-ocr.md"
+            (output_dir / markdown_name).write_text(
+                "<!-- page: 1 -->\n\n",
+                encoding="utf-8",
+            )
+            (page_dir / "0001.md").write_text("\n", encoding="utf-8")
+            manifest = {
+                "generator": "pdf-reader",
+                "schema_version": 6,
+                "source": str(pdf_path),
+                "markdown_file": markdown_name,
+                "parameters": {
+                    "pages": [1],
+                    "images": "none",
+                    "ocr": "auto",
+                    "ocr_language": "eng",
+                    "page_files": True,
+                },
+                "generated_files": [
+                    markdown_name,
+                    "manifest.json",
+                    "pages/0001.md",
+                ],
+                "generated_dirs": ["pages"],
+            }
+            (output_dir / "manifest.json").write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+            registry_path = root / "registry.json"
+            registry_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "conversions": [
+                            {
+                                "source": str(pdf_path),
+                                "output_dir": str(output_dir.resolve()),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                pdf=str(pdf_path),
+                output_dir=str(output_dir),
+                registry_file=str(registry_path),
+                reconvert=False,
+                pages="1",
+                images="none",
+                ocr="auto",
+                ocr_language="eng",
+                no_page_files=False,
+                verbose=False,
+            )
+
+            result = extract_pdf.extract_document(args)
+
+            self.assertFalse(result["already_converted"])
+            markdown = Path(result["markdown"]).read_text(encoding="utf-8")
+            self.assertIn("Hidden OCR body text", markdown)
+            regenerated_manifest = json.loads(
+                Path(result["manifest"]).read_text(encoding="utf-8")
+            )
+            self.assertTrue(regenerated_manifest["quality_passed"])
+            self.assertEqual(
+                regenerated_manifest["page_extractions"][0]["backend"],
+                "pymupdf_native_text",
+            )
+
+    def test_default_names_use_only_source_stem(self) -> None:
         first = Path("/tmp/source-a/report.pdf").resolve()
         second = Path("/tmp/source-b/report.pdf").resolve()
         self.assertEqual(extract_pdf.markdown_filename(first), "report.md")
-        self.assertNotEqual(
-            extract_pdf.default_output_name(first),
-            extract_pdf.default_output_name(second),
-        )
+        first_name = extract_pdf.default_output_name(first)
+        second_name = extract_pdf.default_output_name(second)
+        self.assertEqual(first_name, "report")
+        self.assertEqual(second_name, "report")
+        self.assertNotIn("pdf-reader-output", first_name)
+        self.assertNotIn("images", first_name)
+        self.assertNotIn("ocr", first_name)
         target = Path("/tmp/output/result").resolve()
         self.assertEqual(
             extract_pdf.resolve_registry_file(first, target, None),
             first.parent / extract_pdf.REGISTRY_FILENAME,
         )
+
+    def test_explicit_output_tag_is_normalized_and_appended(self) -> None:
+        source = Path("/tmp/source/report.pdf").resolve()
+        self.assertEqual(
+            extract_pdf.normalize_output_tag(" Needs Review "),
+            "needs-review",
+        )
+        self.assertTrue(
+            extract_pdf.default_output_name(source, "Needs Review").endswith(
+                "-needs-review"
+            )
+        )
+        tagged = extract_pdf.resolve_output_dir(
+            source,
+            "/tmp/output/result",
+            "Needs Review",
+        )
+        self.assertEqual(
+            tagged,
+            Path("/tmp/output/result-needs-review").resolve(),
+        )
+        self.assertEqual(
+            extract_pdf.resolve_output_dir(
+                source,
+                "/tmp/output/result-needs-review",
+                "needs-review",
+            ),
+            tagged,
+        )
+        with self.assertRaises(ValueError):
+            extract_pdf.normalize_output_tag("组会")
+
+    def test_tag_cli_aliases_share_one_destination(self) -> None:
+        parser = extract_pdf.build_parser()
+        for option in ("--tag", "--suffix", "--note"):
+            with self.subTest(option=option):
+                args = parser.parse_args(
+                    ["transfer", "input.pdf", option, "Needs Review"]
+                )
+                self.assertEqual(args.output_tag, "Needs Review")
 
     def test_conversion_id_depends_only_on_source(self) -> None:
         target = Path("/tmp/pdf-reader-result").resolve()
@@ -178,6 +439,7 @@ class ExtractPdfTests(unittest.TestCase):
             "ocr": "off",
             "ocr_language": "eng",
             "page_files": True,
+            "output_tag": None,
         }
         base_id, _ = extract_pdf.make_conversion_id(
             DEMO_PDF.resolve(), target, options
@@ -188,6 +450,7 @@ class ExtractPdfTests(unittest.TestCase):
             "ocr": "auto",
             "ocr_language": "chi_sim+eng",
             "page_files": False,
+            "output_tag": "review",
         }
         for key, value in variants.items():
             with self.subTest(parameter=key):
@@ -228,17 +491,101 @@ class ExtractPdfTests(unittest.TestCase):
             self.assertIn("<!-- page: 1 -->", markdown)
             manifest = json.loads(Path(second["manifest"]).read_text(encoding="utf-8"))
             self.assertEqual(manifest["generator"], "pdf-reader")
+            self.assertEqual(
+                manifest["schema_version"],
+                extract_pdf.MANIFEST_SCHEMA_VERSION,
+            )
             self.assertEqual(manifest["pages_processed"], 1)
+            self.assertIsNone(manifest["output_tag"])
+            self.assertTrue(manifest["quality_passed"])
+            self.assertEqual(len(manifest["page_extractions"]), 1)
+            self.assertIn("backend", manifest["page_extractions"][0])
+            self.assertIn("native_text_chars", manifest["page_extractions"][0])
+            self.assertIn("output_text_chars", manifest["page_extractions"][0])
             self.assertIn("manifest.json", manifest["generated_files"])
             registry = json.loads(Path(second["registry"]).read_text(encoding="utf-8"))
             entry = registry["conversions"][0]
             self.assertEqual(entry["source"], str(DEMO_PDF.resolve()))
             self.assertEqual(entry["output_folder"], "result")
             self.assertEqual(entry["parameters"]["pages"], [1])
+            self.assertEqual(manifest["conversion_id"], extract_pdf.source_key(DEMO_PDF))
             args.reconvert = True
             third = extract_pdf.extract_document(args)
             self.assertFalse(third["already_converted"])
             self.assertEqual(third["conversion_id"], first["conversion_id"])
+
+    def test_refuses_to_replace_output_owned_by_another_source(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            first_source = root / "source-a" / "report.pdf"
+            second_source = root / "source-b" / "report.pdf"
+            first_source.parent.mkdir()
+            second_source.parent.mkdir()
+            first_source.write_bytes(DEMO_PDF.read_bytes())
+            second_source.write_bytes(DEMO_PDF.read_bytes())
+            output_dir = root / "report"
+
+            def args_for(source: Path) -> argparse.Namespace:
+                return argparse.Namespace(
+                    pdf=str(source),
+                    output_dir=str(output_dir),
+                    output_tag=None,
+                    registry_file=str(root / "registry.json"),
+                    reconvert=False,
+                    pages="1",
+                    images="none",
+                    ocr="off",
+                    ocr_language="eng",
+                    no_page_files=False,
+                    verbose=False,
+                )
+
+            extract_pdf.extract_document(args_for(first_source))
+            with self.assertRaisesRegex(ValueError, "另一个 source"):
+                extract_pdf.extract_document(args_for(second_source))
+
+            manifest = json.loads(
+                (output_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["source"], str(first_source.resolve()))
+
+    def test_explicit_tag_creates_tagged_result_instead_of_reusing_untagged(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            output_dir = root / "result"
+            args = argparse.Namespace(
+                pdf=str(DEMO_PDF),
+                output_dir=str(output_dir),
+                output_tag=None,
+                registry_file=str(root / "registry.json"),
+                reconvert=False,
+                pages="1",
+                images="none",
+                ocr="off",
+                ocr_language="eng",
+                no_page_files=False,
+                verbose=False,
+            )
+            untagged = extract_pdf.extract_document(args)
+            self.assertEqual(untagged["output_dir"], str(output_dir.resolve()))
+
+            args.output_tag = "Needs Review"
+            tagged = extract_pdf.extract_document(args)
+            tagged_dir = root / "result-needs-review"
+            self.assertFalse(tagged["already_converted"])
+            self.assertEqual(tagged["output_dir"], str(tagged_dir.resolve()))
+            manifest = json.loads(
+                Path(tagged["manifest"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["output_tag"], "needs-review")
+            self.assertEqual(
+                manifest["parameters"]["output_tag"],
+                "needs-review",
+            )
+
+            reused = extract_pdf.extract_document(args)
+            self.assertTrue(reused["already_converted"])
+            self.assertEqual(reused["output_dir"], str(tagged_dir.resolve()))
 
     def test_same_source_with_different_output_reuses_until_forced(self) -> None:
         with tempfile.TemporaryDirectory() as parent:

@@ -13,6 +13,7 @@ import shutil
 import sys
 import tempfile
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -23,10 +24,16 @@ import pymupdf4llm
 
 
 SCANNED_TEXT_THRESHOLD = 40
-MANIFEST_SCHEMA_VERSION = 6
+OUTPUT_TO_NATIVE_MIN_RATIO = 0.2
+OCR_DPI = 300
+FULL_PAGE_IMAGE_MIN_RATIO = 0.5
+OUTPUT_TAG_MAX_LENGTH = 48
+MANIFEST_SCHEMA_VERSION = 8
 REGISTRY_SCHEMA_VERSION = 1
 REGISTRY_FILENAME = "pdf-reader-conversions.json"
 MARKDOWN_IMAGE_OPEN_RE = re.compile(r"!\[[^\]\n]*\]\(")
+PAGE_MARKER_RE = re.compile(r"<!--\s*page:\s*(\d+)\s*-->")
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 IGNORED_OUTPUT_FILE_NAMES = {".DS_Store"}
 
 
@@ -66,6 +73,73 @@ def parse_pages(spec: str | None, page_count: int) -> list[int]:
     return [page - 1 for page in sorted(selected)]
 
 
+def page_diagnostics(
+    page: pymupdf.Page,
+    page_index: int,
+    *,
+    native_text: str | None = None,
+) -> dict[str, Any]:
+    """Measure native, hidden, visible, image, and display-list page content."""
+    if native_text is None:
+        native_text = page.get_text("text", sort=True)
+
+    raw = page.get_text("rawdict")
+    spans = [
+        span
+        for block in raw.get("blocks", [])
+        if block.get("type") == 0
+        for line in block.get("lines", [])
+        for span in line.get("spans", [])
+    ]
+
+    hidden_spans = [span for span in spans if span.get("alpha", 255) == 0]
+    visible_spans = [span for span in spans if span.get("alpha", 255) != 0]
+    hidden_text_chars = sum(len(span.get("chars", [])) for span in hidden_spans)
+    visible_text_chars = sum(len(span.get("chars", [])) for span in visible_spans)
+
+    bboxlog = page.get_bboxlog()
+    bboxlog_counts = Counter(item[0] for item in bboxlog)
+    page_area = max(float(page.rect.width * page.rect.height), 1.0)
+    image_area_ratios = []
+    for item in bboxlog:
+        if item[0] != "fill-image":
+            continue
+        bbox = pymupdf.Rect(item[1]) & page.rect
+        image_area_ratios.append(max(0.0, float(bbox.width * bbox.height)) / page_area)
+
+    text_chars = len(native_text.strip())
+    image_count = len(page.get_images(full=True))
+    largest_image_area_ratio = max(image_area_ratios, default=0.0)
+    has_page_image = image_count > 0 or bboxlog_counts["fill-image"] > 0
+    hidden_ocr_page = (
+        hidden_text_chars >= SCANNED_TEXT_THRESHOLD
+        and bboxlog_counts["ignore-text"] > 0
+        and largest_image_area_ratio >= FULL_PAGE_IMAGE_MIN_RATIO
+    )
+    likely_scanned = (
+        (text_chars < SCANNED_TEXT_THRESHOLD and has_page_image)
+        or hidden_ocr_page
+    )
+
+    return {
+        "page": page_index + 1,
+        "text_chars": text_chars,
+        "image_count": image_count,
+        "transparent_text_spans": len(hidden_spans),
+        "transparent_text_chars": hidden_text_chars,
+        "visible_text_spans": len(visible_spans),
+        "visible_text_chars": visible_text_chars,
+        "bboxlog": {
+            "ignore_text": bboxlog_counts["ignore-text"],
+            "fill_text": bboxlog_counts["fill-text"],
+            "fill_image": bboxlog_counts["fill-image"],
+        },
+        "largest_image_area_ratio": round(largest_image_area_ratio, 6),
+        "hidden_ocr_page": hidden_ocr_page,
+        "likely_scanned": likely_scanned,
+    }
+
+
 def inspect_document(pdf_path: Path) -> dict[str, Any]:
     with pymupdf.open(pdf_path) as document:
         if document.needs_pass:
@@ -73,24 +147,19 @@ def inspect_document(pdf_path: Path) -> dict[str, Any]:
 
         page_stats = []
         likely_scanned_pages = []
+        hidden_ocr_pages = []
         total_chars = 0
         total_images = 0
         for index, page in enumerate(document):
-            text_chars = len(page.get_text("text").strip())
-            image_count = len(page.get_images(full=True))
-            total_chars += text_chars
-            total_images += image_count
-            likely_scanned = text_chars < SCANNED_TEXT_THRESHOLD and image_count > 0
-            if likely_scanned:
+            native_text = page.get_text("text", sort=True)
+            stats = page_diagnostics(page, index, native_text=native_text)
+            total_chars += stats["text_chars"]
+            total_images += stats["image_count"]
+            if stats["likely_scanned"]:
                 likely_scanned_pages.append(index + 1)
-            page_stats.append(
-                {
-                    "page": index + 1,
-                    "text_chars": text_chars,
-                    "image_count": image_count,
-                    "likely_scanned": likely_scanned,
-                }
-            )
+            if stats["hidden_ocr_page"]:
+                hidden_ocr_pages.append(index + 1)
+            page_stats.append(stats)
 
         toc = [
             {"level": level, "title": title, "page": page}
@@ -104,6 +173,7 @@ def inspect_document(pdf_path: Path) -> dict[str, Any]:
             "text_chars": total_chars,
             "image_count": total_images,
             "likely_scanned_pages": likely_scanned_pages,
+            "hidden_ocr_pages": hidden_ocr_pages,
             "metadata": metadata,
             "toc": toc,
             "pages": page_stats,
@@ -120,8 +190,34 @@ def source_key(pdf_path: Path) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def default_output_name(pdf_path: Path) -> str:
-    return f"{safe_stem(pdf_path)}-{source_key(pdf_path)[:8]}-pdf-reader-output"
+def normalize_output_tag(value: str | None) -> str | None:
+    """Normalize an explicitly requested English output-folder tag."""
+    if value is None or not value.strip():
+        return None
+    tag = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
+    if not tag:
+        raise ValueError("--tag 必须包含英文关键词或数字")
+    tag = tag[:OUTPUT_TAG_MAX_LENGTH].rstrip("-")
+    if not tag:
+        raise ValueError("--tag 无法生成有效的英文关键词")
+    return tag
+
+
+def append_output_tag(path: Path, output_tag: str | None) -> Path:
+    if not output_tag:
+        return path
+    suffix = f"-{output_tag}"
+    if path.name.lower().endswith(suffix):
+        return path
+    return path.with_name(f"{path.name}{suffix}")
+
+
+def default_output_name(pdf_path: Path, output_tag: str | None = None) -> str:
+    base_name = safe_stem(pdf_path)
+    return append_output_tag(
+        Path(base_name),
+        normalize_output_tag(output_tag),
+    ).name
 
 
 def markdown_filename(pdf_path: Path) -> str:
@@ -139,6 +235,7 @@ def make_conversion_id(
         "source_size": stat.st_size,
         "source_mtime_ns": stat.st_mtime_ns,
         "output_dir": str(output_dir),
+        "pymupdf_version": pymupdf.__version__,
         "pymupdf4llm_version": pymupdf4llm.__version__,
         "parameters": parameters,
     }
@@ -182,6 +279,29 @@ def convert_pages(
     if verbose and library_output.getvalue():
         print(library_output.getvalue(), file=sys.stderr, end="")
     return chunks
+
+
+def raster_ocr_page(
+    document: pymupdf.Document,
+    page_index: int,
+    *,
+    language: str,
+) -> str:
+    """OCR an independent rasterized page so existing PDF text cannot interfere."""
+    page_number_value = page_index + 1
+    try:
+        pixmap = document[page_index].get_pixmap(
+            dpi=OCR_DPI,
+            colorspace=pymupdf.csRGB,
+            alpha=False,
+        )
+        ocr_pdf = pixmap.pdfocr_tobytes(language=language, compress=True)
+        with pymupdf.open(stream=ocr_pdf, filetype="pdf") as ocr_document:
+            return ocr_document[0].get_text("text", sort=True).strip()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"PDF 第 {page_number_value} 页位图 OCR 失败: {exc}"
+        ) from exc
 
 
 def markdown_unescape(value: str) -> str:
@@ -303,10 +423,200 @@ def portable_markdown(
     return rewritten.strip() + "\n"
 
 
-def resolve_output_dir(pdf_path: Path, value: str | None) -> Path:
-    if value:
-        return Path(value).expanduser().resolve()
-    return (Path.cwd() / default_output_name(pdf_path)).resolve()
+def remove_markdown_image_links(text: str) -> str:
+    """Remove image link targets before measuring actual body text."""
+    lines = []
+    for original_line in text.splitlines(keepends=True):
+        line = original_line
+        search_from = 0
+        while True:
+            opening = MARKDOWN_IMAGE_OPEN_RE.search(line, search_from)
+            if not opening:
+                break
+            bounds = markdown_image_target_bounds(line, opening.end())
+            if not bounds:
+                search_from = opening.end()
+                continue
+            closing = bounds[2]
+            line = f"{line[:opening.start()]}{line[closing + 1:]}"
+            search_from = opening.start()
+        lines.append(line)
+    return "".join(lines)
+
+
+def markdown_body_char_count(text: str) -> int:
+    """Count non-whitespace body characters, excluding comments and image paths."""
+    without_comments = HTML_COMMENT_RE.sub("", text)
+    without_images = remove_markdown_image_links(without_comments)
+    return len(re.sub(r"\s+", "", without_images))
+
+
+def markdown_image_references(text: str) -> list[str]:
+    """Collect generated Markdown image expressions for a text fallback."""
+    references = []
+    for line in text.splitlines():
+        search_from = 0
+        while True:
+            opening = MARKDOWN_IMAGE_OPEN_RE.search(line, search_from)
+            if not opening:
+                break
+            bounds = markdown_image_target_bounds(line, opening.end())
+            if not bounds:
+                search_from = opening.end()
+                continue
+            closing = bounds[2]
+            references.append(line[opening.start() : closing + 1])
+            search_from = closing + 1
+    return references
+
+
+def preserve_image_references(replacement: str, generated_markdown: str) -> str:
+    references = markdown_image_references(generated_markdown)
+    parts = [replacement.strip(), *references]
+    return "\n\n".join(part for part in parts if part).strip()
+
+
+def output_is_far_below_native(output_text: str, native_text: str) -> bool:
+    native_chars = markdown_body_char_count(native_text)
+    if native_chars < SCANNED_TEXT_THRESHOLD:
+        return False
+    output_chars = markdown_body_char_count(output_text)
+    return output_chars < native_chars * OUTPUT_TO_NATIVE_MIN_RATIO
+
+
+def extract_page_content(
+    pdf_path: Path,
+    pages: list[int],
+    chunks: list[dict[str, Any]],
+    inspection: dict[str, Any],
+    *,
+    ocr_mode: str,
+    ocr_language: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Choose a verified extraction backend independently for every page."""
+    chunks_by_page = {page_number(chunk): chunk for chunk in chunks}
+    diagnostics_by_page = {
+        item["page"]: item for item in inspection.get("pages", [])
+    }
+    verified_chunks = []
+    extraction_records = []
+
+    with pymupdf.open(pdf_path) as document:
+        for page_index in pages:
+            number = page_index + 1
+            original_chunk = chunks_by_page.get(number) or {
+                "metadata": {"page_number": number},
+                "text": "",
+            }
+            generated_text = str(original_chunk.get("text") or "")
+            native_text = document[page_index].get_text("text", sort=True).strip()
+            page_stats = diagnostics_by_page[number]
+
+            backend = "pymupdf4llm"
+            fallback_reason = None
+            selected_text = generated_text
+
+            needs_raster_ocr = ocr_mode == "force" or (
+                ocr_mode == "auto"
+                and page_stats["likely_scanned"]
+                and markdown_body_char_count(native_text) < SCANNED_TEXT_THRESHOLD
+            )
+            if needs_raster_ocr:
+                selected_text = raster_ocr_page(
+                    document,
+                    page_index,
+                    language=ocr_language,
+                )
+                selected_text = preserve_image_references(
+                    selected_text,
+                    generated_text,
+                )
+                backend = "tesseract_raster_ocr"
+                fallback_reason = (
+                    "ocr_force" if ocr_mode == "force" else "ocr_auto_scanned_page"
+                )
+            elif (
+                page_stats["hidden_ocr_page"]
+                and markdown_body_char_count(native_text) >= SCANNED_TEXT_THRESHOLD
+            ):
+                selected_text = preserve_image_references(
+                    native_text,
+                    generated_text,
+                )
+                backend = "pymupdf_native_text"
+                fallback_reason = "hidden_ocr_page_prefers_native_text"
+
+            candidate_backend = backend
+            if output_is_far_below_native(selected_text, native_text):
+                selected_text = preserve_image_references(
+                    native_text,
+                    generated_text,
+                )
+                backend = "pymupdf_native_text"
+                fallback_reason = (
+                    f"{candidate_backend}_output_below_native_text_ratio"
+                )
+
+            native_body_chars = markdown_body_char_count(native_text)
+            output_body_chars = markdown_body_char_count(selected_text)
+            quality_passed = not (
+                native_body_chars >= SCANNED_TEXT_THRESHOLD
+                and output_body_chars
+                < native_body_chars * OUTPUT_TO_NATIVE_MIN_RATIO
+            )
+            if not quality_passed:
+                raise RuntimeError(
+                    "PDF 第 "
+                    f"{number} 页正文质量检查失败: 输出 {output_body_chars} 字符，"
+                    f"原生文本 {native_body_chars} 字符"
+                )
+
+            verified_chunk = dict(original_chunk)
+            metadata = dict(verified_chunk.get("metadata") or {})
+            metadata["page_number"] = number
+            verified_chunk["metadata"] = metadata
+            verified_chunk["text"] = selected_text
+            verified_chunks.append(verified_chunk)
+            extraction_records.append(
+                {
+                    "page": number,
+                    "backend": backend,
+                    "native_text_chars": len(native_text),
+                    "native_body_chars": native_body_chars,
+                    "pymupdf4llm_text_chars": len(generated_text.strip()),
+                    "pymupdf4llm_body_chars": markdown_body_char_count(
+                        generated_text
+                    ),
+                    "output_text_chars": len(selected_text.strip()),
+                    "output_body_chars": output_body_chars,
+                    "hidden_ocr_page": page_stats["hidden_ocr_page"],
+                    "quality_passed": quality_passed,
+                    "fallback_reason": fallback_reason,
+                }
+            )
+
+    if pages and not any(record["output_body_chars"] for record in extraction_records):
+        attempted_ocr = ocr_mode != "off" and any(
+            diagnostics_by_page[page + 1]["likely_scanned"] for page in pages
+        )
+        if attempted_ocr:
+            raise RuntimeError("所有选定页面的 OCR 正文均为空，拒绝登记空转换结果")
+
+    return verified_chunks, extraction_records
+
+
+def resolve_output_dir(
+    pdf_path: Path,
+    value: str | None,
+    output_tag: str | None = None,
+) -> Path:
+    normalized_tag = normalize_output_tag(output_tag)
+    base = (
+        Path(value).expanduser().resolve()
+        if value
+        else (Path.cwd() / default_output_name(pdf_path)).resolve()
+    )
+    return append_output_tag(base, normalized_tag)
 
 
 def validate_replaceable_output(target: Path) -> dict[str, Any] | None:
@@ -418,6 +728,70 @@ def manifest_markdown_path(output_dir: Path, manifest: dict[str, Any]) -> Path:
     raise ValueError(f"manifest.json 未记录合并 Markdown: {output_dir}")
 
 
+def split_combined_markdown_pages(text: str) -> dict[int, str]:
+    matches = list(PAGE_MARKER_RE.finditer(text))
+    pages = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        pages[int(match.group(1))] = text[match.end() : end]
+    return pages
+
+
+def output_page_texts(
+    output_dir: Path,
+    manifest: dict[str, Any],
+) -> dict[int, str]:
+    page_dir = output_dir / "pages"
+    if page_dir.is_dir():
+        result = {}
+        for page_path in page_dir.glob("*.md"):
+            try:
+                number = int(page_path.stem)
+            except ValueError:
+                continue
+            result[number] = page_path.read_text(encoding="utf-8")
+        return result
+
+    combined = manifest_markdown_path(output_dir, manifest).read_text(
+        encoding="utf-8"
+    )
+    return split_combined_markdown_pages(combined)
+
+
+def registered_output_quality_is_valid(
+    output_dir: Path,
+    manifest: dict[str, Any],
+    pdf_path: Path,
+) -> bool:
+    """Reject both new failed manifests and legacy low-text conversion results."""
+    if manifest.get("quality_passed") is False:
+        return False
+    extraction_records = manifest.get("page_extractions")
+    if isinstance(extraction_records, list) and extraction_records:
+        return all(record.get("quality_passed") is not False for record in extraction_records)
+
+    try:
+        page_texts = output_page_texts(output_dir, manifest)
+        selected_pages = (manifest.get("parameters") or {}).get("pages") or sorted(
+            page_texts
+        )
+        if not isinstance(selected_pages, list) or not selected_pages:
+            return False
+        with pymupdf.open(pdf_path) as document:
+            for number in selected_pages:
+                if not isinstance(number, int) or not 1 <= number <= document.page_count:
+                    return False
+                output_text = page_texts.get(number)
+                if output_text is None:
+                    return False
+                native_text = document[number - 1].get_text("text", sort=True)
+                if output_is_far_below_native(output_text, native_text):
+                    return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
 def repair_output_image_links(output_dir: Path, manifest: dict[str, Any]) -> int:
     """Repair temporary image paths in an otherwise valid existing result."""
     image_dir = output_dir / "images"
@@ -459,7 +833,8 @@ def find_registered_conversion(
             continue
         if manifest and same_source(manifest.get("source"), pdf_path):
             repair_output_image_links(output_dir, manifest)
-            return entry, manifest
+            if registered_output_quality_is_valid(output_dir, manifest, pdf_path):
+                return entry, manifest
     return None
 
 
@@ -498,14 +873,16 @@ def upsert_registry_entry(
 def extract_document(args: argparse.Namespace) -> dict[str, Any]:
     started = time.perf_counter()
     pdf_path = validate_pdf(args.pdf)
+    output_tag = normalize_output_tag(getattr(args, "output_tag", None))
     requested_options = {
         "pages": args.pages or "all",
         "images": args.images,
         "ocr": args.ocr,
         "ocr_language": args.ocr_language,
         "page_files": not args.no_page_files,
+        "output_tag": output_tag,
     }
-    target = resolve_output_dir(pdf_path, args.output_dir)
+    target = resolve_output_dir(pdf_path, args.output_dir, output_tag)
     registry_path = resolve_registry_file(pdf_path, target, args.registry_file)
     registry = load_registry(registry_path)
     registered = (
@@ -513,12 +890,33 @@ def extract_document(args: argparse.Namespace) -> dict[str, Any]:
         if args.reconvert
         else find_registered_conversion(registry, pdf_path)
     )
+    if registered and output_tag:
+        registered_tag = registered[1].get("output_tag") or (
+            registered[1].get("parameters") or {}
+        ).get("output_tag")
+        if registered_tag != output_tag:
+            registered = None
     existing_manifest = None
     if not registered:
         existing_manifest = validate_replaceable_output(target)
+        if existing_manifest and not same_source(
+            existing_manifest.get("source"), pdf_path
+        ):
+            raise ValueError(
+                "输出文件夹已属于另一个 source，拒绝覆盖: "
+                f"{target}；请指定其他 --output-dir 或显式 --tag"
+            )
     if not registered and not args.reconvert and existing_manifest:
         if same_source(existing_manifest.get("source"), pdf_path):
             repair_output_image_links(target, existing_manifest)
+        if (
+            same_source(existing_manifest.get("source"), pdf_path)
+            and registered_output_quality_is_valid(
+                target,
+                existing_manifest,
+                pdf_path,
+            )
+        ):
             stat = pdf_path.stat()
             registered_parameters = existing_manifest.get("parameters") or {}
             conversion_id = source_key(pdf_path)
@@ -529,6 +927,9 @@ def extract_document(args: argparse.Namespace) -> dict[str, Any]:
                     "source_mtime_ns", stat.st_mtime_ns
                 ),
                 "output_dir": str(target),
+                "pymupdf_version": existing_manifest.get(
+                    "pymupdf_version", pymupdf.__version__
+                ),
                 "pymupdf4llm_version": existing_manifest.get(
                     "pymupdf4llm_version", pymupdf4llm.__version__
                 ),
@@ -563,6 +964,7 @@ def extract_document(args: argparse.Namespace) -> dict[str, Any]:
             "parameters_ignored": True,
             "registered_parameters": registered_parameters,
             "requested_parameters": requested_options,
+            "output_tag": registered_manifest.get("output_tag"),
         }
 
     inspection = inspect_document(pdf_path)
@@ -576,6 +978,7 @@ def extract_document(args: argparse.Namespace) -> dict[str, Any]:
         "ocr": args.ocr,
         "ocr_language": args.ocr_language,
         "page_files": not args.no_page_files,
+        "output_tag": output_tag,
     }
     conversion_id, identity = make_conversion_id(pdf_path, target, options)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -587,55 +990,25 @@ def extract_document(args: argparse.Namespace) -> dict[str, Any]:
     if write_images:
         image_dir.mkdir()
 
-    scanned = {page - 1 for page in inspection["likely_scanned_pages"]}
     try:
-        if args.ocr == "off":
-            chunks = convert_pages(
-                pdf_path,
-                pages,
-                image_dir=image_dir,
-                write_images=write_images,
-                use_ocr=False,
-                force_ocr=False,
-                ocr_language=args.ocr_language,
-                verbose=args.verbose,
-            )
-        elif args.ocr == "force":
-            chunks = convert_pages(
-                pdf_path,
-                pages,
-                image_dir=image_dir,
-                write_images=write_images,
-                use_ocr=True,
-                force_ocr=True,
-                ocr_language=args.ocr_language,
-                verbose=args.verbose,
-            )
-        else:
-            native_pages = [page for page in pages if page not in scanned]
-            scanned_pages = [page for page in pages if page in scanned]
-            chunks = convert_pages(
-                pdf_path,
-                native_pages,
-                image_dir=image_dir,
-                write_images=write_images,
-                use_ocr=False,
-                force_ocr=False,
-                ocr_language=args.ocr_language,
-                verbose=args.verbose,
-            )
-            chunks.extend(
-                convert_pages(
-                    pdf_path,
-                    scanned_pages,
-                    image_dir=image_dir,
-                    write_images=write_images,
-                    use_ocr=True,
-                    force_ocr=True,
-                    ocr_language=args.ocr_language,
-                    verbose=args.verbose,
-                )
-            )
+        chunks = convert_pages(
+            pdf_path,
+            pages,
+            image_dir=image_dir,
+            write_images=write_images,
+            use_ocr=False,
+            force_ocr=False,
+            ocr_language=args.ocr_language,
+            verbose=args.verbose,
+        )
+        chunks, page_extractions = extract_page_content(
+            pdf_path,
+            pages,
+            chunks,
+            inspection,
+            ocr_mode=args.ocr,
+            ocr_language=args.ocr_language,
+        )
 
         chunks.sort(key=page_number)
         document_parts = []
@@ -687,6 +1060,10 @@ def extract_document(args: argparse.Namespace) -> dict[str, Any]:
             "markdown_file": markdown_name,
             "pages_processed": len(chunks),
             "likely_scanned_pages": inspection["likely_scanned_pages"],
+            "hidden_ocr_pages": inspection["hidden_ocr_pages"],
+            "quality_passed": True,
+            "page_extractions": page_extractions,
+            "output_tag": output_tag,
             "image_count": image_count,
             "metadata": inspection["metadata"],
             "toc": inspection["toc"],
@@ -725,6 +1102,7 @@ def extract_document(args: argparse.Namespace) -> dict[str, Any]:
         "conversion_id": conversion_id,
         "page_count": len(chunks),
         "image_count": image_count,
+        "output_tag": output_tag,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
     }
 
@@ -749,7 +1127,14 @@ def build_parser() -> argparse.ArgumentParser:
     extract_parser.add_argument("pdf", help="PDF 文件路径")
     extract_parser.add_argument(
         "--output-dir",
-        help="最终结果文件夹；默认创建 <PDF文件名>-<source短标识>-pdf-reader-output",
+        help="最终结果文件夹；默认创建 <PDF文件名>",
+    )
+    extract_parser.add_argument(
+        "--tag",
+        "--suffix",
+        "--note",
+        dest="output_tag",
+        help="仅在用户显式要求时追加到输出文件夹末尾的英文关键词",
     )
     extract_parser.add_argument(
         "--registry-file",
@@ -772,7 +1157,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--ocr",
         choices=("auto", "off", "force"),
         default="auto",
-        help="auto 仅对疑似扫描页 OCR；off 最快；force 强制 OCR",
+        help="auto 按页选择原生文本或位图 OCR；off 禁用 OCR；force 强制位图 OCR",
     )
     extract_parser.add_argument("--ocr-language", default="eng", help="OCR 语言")
     extract_parser.add_argument("--no-page-files", action="store_true", help="不生成逐页 Markdown")

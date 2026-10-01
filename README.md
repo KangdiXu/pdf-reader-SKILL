@@ -1,6 +1,6 @@
 # pdf-reader 使用手册
 
-`pdf-reader` 使用 PyMuPDF4LLM 转换或阅读本地 PDF。它优先读取文本，只有任务确实需要时才提取图片或运行 OCR。每次成功转换都会登记到一个 JSON 文件；只要 PDF 的 `source` 绝对路径已经有有效记录，默认就不再转换，不比较页数、图片、OCR、输出路径、文件修改时间或解析器版本。只有用户明确要求“忽略重复”“必须转换”等强制指令时才重新转换。
+`pdf-reader` 结合 PyMuPDF4LLM、PyMuPDF 原生文本层和 Tesseract 转换或阅读本地 PDF。它优先读取文本，逐页检查正文质量，只有任务确实需要时才提取图片或运行 OCR。每次成功转换都会登记到一个 JSON 文件；只要 PDF 的 `source` 绝对路径已经有有效且通过质量验证的记录，默认就不再转换，不比较页数、图片、OCR、输出路径、文件修改时间或解析器版本。旧结果若正文相对原生文本严重缺失，则不会继续复用。只有用户明确要求“忽略重复”“必须转换”等强制指令时才重新转换一个原本有效的结果。
 
 ## 安装
 
@@ -31,6 +31,7 @@ install_pdf_read_env.cmd
 图像：<不生成图片 / 生成选定页图片 / 生成所有处理页图片>
 OCR：<自动 / 不使用 OCR / 强制 OCR>
 OCR 语言：<无需 / eng / chi_sim+eng / 其他已安装语言>
+输出 tag：<无 / 用户显式要求的简短英文关键词>
 任务：<可选，要总结、查找或核对什么>
 输出目录：<可选，结果文件夹或批处理输出根目录>
 重复处理：<默认 / 忽略重复，必须转换>（建议放在最后）
@@ -42,7 +43,7 @@ OCR 语言：<无需 / eng / chi_sim+eng / 其他已安装语言>
 转换这个文件夹所有 PDF 文件，全文，不生成图片，不使用 OCR。
 ```
 
-格式化输入是推荐写法，不是强制语法；Codex 也会理解含义相同的自然语言。如果确实需要重新生成，把“忽略重复”或“必须转换”放在所有参数之后，例如：
+格式化输入是推荐写法，不是强制语法；Codex 也会理解含义相同的自然语言。只有用户明确提出“添加后缀”“tag”或“备注”时，才会生成英文 kebab-case tag 并追加到输出文件夹名称，例如“备注：组会”映射为 `group-meeting`。页码、图片和 OCR 等处理选项不会自动进入文件夹名称；它们记录在 `manifest.json`。如果确实需要重新生成，把“忽略重复”或“必须转换”放在所有参数之后，例如：
 
 ```text
 转换 report.pdf，全文，不生成图片，不使用 OCR，忽略重复，必须转换。
@@ -85,7 +86,7 @@ OCR 语言：无需
 
 ## 输出文件夹规则
 
-`--output-dir` 表示强制转换或首次转换使用的最终结果文件夹。例如：
+`--output-dir` 表示强制转换或首次转换使用的基础结果文件夹。例如：
 
 ```bash
 --output-dir "/Users/me/Documents/report-output"
@@ -103,11 +104,27 @@ OCR 语言：无需
 
 所有提取图片最终都保存在结果文件夹的 `images/` 中。合并 Markdown 使用 `images/<图片文件名>`，逐页 Markdown 使用 `../images/<图片文件名>`，因此两者都能正确定位同一个最终图片文件。输出内容不会保留 `.临时目录/.../images/` 路径。复用旧转换结果时，skill 会自动修正历史 Markdown 中残留的临时图片路径，无需重新解析 PDF。
 
-如果没有提供 `--output-dir`，默认在当前工作目录创建。短标识来自源 PDF 的绝对路径，用于避免不同目录下的同名 PDF 互相覆盖：
+如果没有提供 `--output-dir`，默认在当前工作目录创建只使用 PDF 文件名的结果文件夹：
 
 ```text
-<PDF文件名>-<source短标识>-pdf-reader-output/
+<PDF文件名>/
 ```
+
+默认名称不会包含 source 短标识、`images`、`no-ocr`、页码或 `pdf-reader-output` 等信息；源文件身份和处理参数统一保存在 `manifest.json` 中。若当前工作目录里同名文件夹已经属于另一个 source，程序会拒绝覆盖，并要求指定其他 `--output-dir` 或显式 tag。
+
+仅当用户在对话中显式要求后缀、tag 或备注时，才使用 `--tag`（同义参数为 `--suffix` 和 `--note`）。Tag 会规范化为小写英文 kebab-case，并追加到自动名称或显式 `--output-dir` 的结尾：
+
+```bash
+--tag "Needs Review"
+```
+
+产生：
+
+```text
+<PDF文件名>-needs-review/
+```
+
+如果同时指定 `--output-dir "/Users/me/Documents/report"`，结果为 `/Users/me/Documents/report-needs-review/`。纯中文 CLI tag 会被拒绝；在对话中由 Codex 先把中文备注转换成简短英文关键词。
 
 默认在源 PDF 所在目录创建 `pdf-reader-conversions.json`，用于登记已经完成的转换。这样，即使后来请求另一个输出目录，也能根据同一个 `source` 找到原结果。源目录不可写时，可使用 `--registry-file` 指定一个可写的固定登记文件。
 
@@ -115,13 +132,13 @@ OCR 语言：无需
 
 - 源 PDF 的绝对路径
 
-登记中存在该 `source` 且结果仍然有效时，以下变化都**不会**自动重新转换：页数、图像模式、OCR 模式、OCR 语言、是否生成逐页文件、请求的输出目录、源文件大小或修改时间、PyMuPDF4LLM 版本。程序会返回登记中原有的结果位置，并同时返回已登记参数和本次请求参数，便于发现差异。
+登记中存在该 `source` 且结果仍然有效时，以下变化都**不会**自动重新转换：页数、图像模式、OCR 模式、OCR 语言、是否生成逐页文件、请求的输出目录、源文件大小或修改时间、PyMuPDF4LLM 版本。程序会返回登记中原有的结果位置，并同时返回已登记参数和本次请求参数，便于发现差异。显式 tag 是例外：只有 tag 相同的结果才会复用；不同的显式 tag 会生成对应的新文件夹并更新该 source 的当前登记。
 
 需要让新参数真正生效时，必须在指令末尾明确写“忽略重复”“必须转换”“强制转换”或“重新转换”。Skill 会把它映射成 `--reconvert`，也可以在命令行使用同义别名 `--force`。强制转换完成后，这个 `source` 的登记会更新为最新结果。
 
 如果强制转换指定了新的输出目录，登记会改为指向新结果；旧输出目录不会自动删除，但不再是该 `source` 的当前登记结果。
 
-只有登记项指向的输出文件夹、`manifest.json` 和生成文件结构都仍然有效时才会复用。否则会执行新转换。同一个输出文件夹需要重新生成时：
+只有登记项指向的输出文件夹、`manifest.json`、生成文件结构和正文质量都仍然有效时才会复用。旧版清单没有逐页质量记录时，程序会把已有逐页 Markdown 与源 PDF 的原生文本量比较；空正文或明显缺失的结果会被判为无效并重新生成。同一个输出文件夹需要重新生成时：
 
 - 如果它为空，可以写入。
 - 如果它是此前生成的完整 `pdf-reader` 输出，并且不包含额外文件，可以安全替换。
@@ -138,11 +155,13 @@ OCR 语言：无需
   │
   否
   ↓
-检查 PDF，获得页数、目录、文本量、图片数和疑似扫描页
+检查 PDF，获得页数、目录、文本量、图片数、隐藏 OCR 页和疑似扫描页
   ↓
 选择页码、图片和 OCR 参数
   ↓
-文本优先提取；只对疑似扫描页 OCR
+运行布局提取并逐页检查正文质量
+  ↓
+隐藏 OCR 页优先使用原生文字；真正扫描页先渲染位图再 OCR
   ↓
 按需提取相关页面图片
   ↓
@@ -172,7 +191,7 @@ conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
   inspect "/Users/me/Documents/report.pdf"
 ```
 
-输出结果：终端返回 JSON，包括 `page_count`、`text_chars`、`image_count`、`likely_scanned_pages`、文档元数据和目录；不会创建结果文件夹。
+输出结果：终端返回 JSON，包括 `page_count`、`text_chars`、`image_count`、`likely_scanned_pages`、`hidden_ocr_pages`、文档元数据和目录；使用 `--include-pages` 时还会给出透明/可见文本 span 与字符数、`ignore-text` / `fill-text` / `fill-image` 计数和最大图片页面占比。检查不会创建结果文件夹。
 
 ## 场景二：总结一份较短的普通 PDF
 
@@ -294,7 +313,7 @@ conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
 只总结技术实现部分，输出到 /Users/me/Documents/spec-output。
 ```
 
-Skill 处理方法：关闭 OCR，只运行原生文本和布局提取。
+Skill 处理方法：关闭 Tesseract OCR，运行布局提取并执行原生文本质量回退；因此即使 PyMuPDF4LLM 漏掉透明文字层，也不会把可用的原生正文丢弃。
 
 底层命令：
 
@@ -321,7 +340,7 @@ conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
 把结果保存到 /Users/me/Documents/contract-output。
 ```
 
-Skill 处理方法：仅对指定页面强制 OCR，并使用请求的 OCR 语言。OCR 较慢，应尽量缩小页码范围。
+Skill 处理方法：先把每个指定页面渲染成独立位图，再交给 Tesseract 强制 OCR，并使用请求的 OCR 语言。这样原 PDF 已有的透明文本层不会干扰 OCR。OCR 较慢，应尽量缩小页码范围。
 
 底层命令：
 
@@ -348,7 +367,7 @@ conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
 把结果保存到 /Users/me/Documents/mixed-output。
 ```
 
-Skill 处理方法：保留默认的 `--ocr auto`。脚本先检测每页的原生文本密度，只把疑似扫描页交给 OCR，正常文字页使用快速路径。
+Skill 处理方法：保留默认的 `--ocr auto`。脚本同时检查原生文本密度、透明文本 alpha、显示列表中的 `ignore-text` / `fill-text` / `fill-image` 和整页图片占比。具有足够透明 OCR 正文的页面直接使用 PyMuPDF 原生文本；原生层不足的扫描页才渲染成独立位图交给 Tesseract；正常文字页使用 PyMuPDF4LLM，并在正文量异常偏低时回退到原生文本。
 
 底层命令：
 
@@ -359,7 +378,7 @@ conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
   --ocr auto
 ```
 
-输出结果：正常页面和 OCR 页面按照原页码重新合并；`manifest.json` 记录检测到的 `likely_scanned_pages`。
+输出结果：正常页面、原生文本回退页面和 OCR 页面按照原页码重新合并；`manifest.json` 记录 `likely_scanned_pages`、`hidden_ocr_pages` 和每页实际后端。
 
 ## 场景九：高精度核对表格、金额或统计数字
 
@@ -477,7 +496,7 @@ rg --files --max-depth 1 -g '*.pdf' -g '*.PDF' "/Users/me/Documents/reports"
 ```bash
 conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
   extract "/Users/me/Documents/reports/annual-report.pdf" \
-  --output-dir "/Users/me/Documents/reports-output/annual-report-pdf-reader-output" \
+  --output-dir "/Users/me/Documents/reports-output/annual-report" \
   --images none \
   --ocr off
 ```
@@ -515,15 +534,16 @@ conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
 | 参数 | 含义 | 适用场景 |
 |---|---|---|
 | `--output-dir "/path/result"` | 最终结果文件夹 | 指定输出位置 |
+| `--tag "needs-review"` | 用户显式要求时追加英文 tag；同义参数为 `--suffix`、`--note` | 后缀、tag、备注 |
 | `--registry-file "/path/pdf-reader-conversions.json"` | 指定转换登记 JSON | 源目录不可写或需要集中登记时 |
 | `--reconvert` / `--force` | 忽略 source 重复记录并重新转换 | “忽略重复”“必须转换”等明确要求 |
 | `--pages "1-10,18,25-30"` | 只处理指定的 1-based PDF 页码 | 已知章节或目标页 |
 | `--images none` | 不提取图片，默认值 | 总结、搜索、普通文本分析 |
 | `--images selected` | 提取明确指定页面的图片，必须配合 `--pages` | 图表、公式、表格、版式 |
 | `--images all` | 提取所有已处理页面的图片 | 明确需要整份文档视觉内容时 |
-| `--ocr auto` | 只对疑似扫描页 OCR，默认值 | 普通或混合型 PDF |
-| `--ocr off` | 完全关闭 OCR | 确定具有正常文本层时 |
-| `--ocr force` | 强制 OCR 所有选定页面 | 扫描件 |
+| `--ocr auto` | 隐藏 OCR 页使用原生层；无可用原生层的扫描页做位图 OCR，默认值 | 普通或混合型 PDF |
+| `--ocr off` | 关闭 Tesseract OCR，但仍保留原生文本质量回退 | 确定具有可用文本层时 |
+| `--ocr force` | 把所有选定页面独立渲染后强制 Tesseract OCR | 扫描件 |
 | `--ocr-language chi_sim+eng` | 指定 OCR 语言 | 中英文扫描件 |
 | `--no-page-files` | 不生成逐页 Markdown | 只需要一个合并文件时 |
 | `--verbose` | 把解析器日志写入 stderr | 调试提取或 OCR 问题 |
@@ -536,7 +556,7 @@ conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
 Documents/
 ├── report.pdf                   # source
 ├── pdf-reader-conversions.json  # 按 source 去重的登记表
-└── report-a1b2c3d4-pdf-reader-output/
+└── report/
     ├── report.md                # 合并后的 Markdown，含 PDF 页码标记
     ├── manifest.json            # 当前输出文件夹的完整说明
     ├── pages/
@@ -558,6 +578,7 @@ Documents/
   "conversion_id": "...",
   "page_count": 12,
   "image_count": 0,
+  "output_tag": null,
   "elapsed_seconds": 1.42
 }
 ```
@@ -577,7 +598,8 @@ Documents/
   "conversion_id": "...",
   "parameters_ignored": true,
   "registered_parameters": {"pages": [1, 2, 3], "images": "none", "ocr": "off"},
-  "requested_parameters": {"pages": "2", "images": "selected", "ocr": "force"}
+  "requested_parameters": {"pages": "2", "images": "selected", "ocr": "force"},
+  "output_tag": null
 }
 ```
 
@@ -588,8 +610,8 @@ Documents/
 - `conversion_id`：只由源 PDF 绝对路径生成的稳定标识；参数和输出路径不参与计算
 - `source`：源 PDF 绝对路径
 - `source_size`、`source_mtime_ns`：生成时记录的信息，不参与重复判断
-- `pymupdf4llm_version`：执行转换的解析器版本
-- `parameters`：`pages`、`images`、`ocr`、`ocr_language`、`page_files`
+- `pymupdf_version`、`pymupdf4llm_version`：执行转换的解析器版本
+- `parameters`：`pages`、`images`、`ocr`、`ocr_language`、`page_files`、`output_tag`
 - `output_dir`：转换结果文件夹绝对路径
 - `output_folder`：转换结果文件夹名称
 - `manifest`：该结果对应的 `manifest.json` 路径
@@ -600,14 +622,18 @@ Documents/
 每个结果文件夹内的 `manifest.json` 只描述当前这一次转换，包含：
 
 - `generator`、`schema_version`：生成器和清单格式版本
-- `conversion_id`、`generated_at`：转换标识和生成时间
+- `conversion_id`、`generated_at`：转换标识和生成时间；`conversion_id` 是源 PDF 绝对路径的完整哈希，只记录在清单和登记中，不进入默认文件夹名称
 - `source`、`source_size`、`source_mtime_ns`：源文件身份与版本信息
 - `output_dir`：本次转换绑定的输出文件夹绝对路径
-- `pymupdf4llm_version`：解析器版本
+- `pymupdf_version`、`pymupdf4llm_version`：解析器版本
 - `parameters`：本次转换使用的全部参数
+- `output_tag`：用户显式要求并规范化后的英文 tag；未要求时为 `null`
 - `markdown_file`：按源文件名生成的合并 Markdown 文件名
 - `pages_processed`：实际处理页数
 - `likely_scanned_pages`：探测到的疑似扫描页
+- `hidden_ocr_pages`：检测到“整页图片 + 透明 OCR 文字层”的页面
+- `quality_passed`：本次转换是否通过正文质量检查
+- `page_extractions`：逐页记录 `backend`、原生/PyMuPDF4LLM/最终正文字符数、`hidden_ocr_page`、`quality_passed` 和 `fallback_reason`
 - `image_count`：输出图片数量
 - `metadata`：PDF 自带的标题、作者、主题等元数据
 - `toc`：PDF 目录

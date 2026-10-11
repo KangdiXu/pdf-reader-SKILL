@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
@@ -50,6 +51,53 @@ class ExtractPdfTests(unittest.TestCase):
             extract_pdf.parse_pages("0", 5)
         with self.assertRaises(ValueError):
             extract_pdf.parse_pages("4-2", 5)
+
+    def test_image_extraction_uses_short_names_and_preserves_region_numbers(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            source = root / ("long_source_" * 15 + ".pdf")
+            source.write_bytes(DEMO_PDF.read_bytes())
+            image_dir = root / "images"
+            image_dir.mkdir()
+
+            def fake_markdown(document, **kwargs):
+                self.assertIsInstance(document, extract_pdf.pymupdf.Document)
+                self.assertEqual(document.name, "pdf-reader.pdf")
+                self.assertEqual(kwargs["pages"], [1])
+                self.assertEqual(kwargs["image_format"], "png")
+                text = ""
+                for region in (3, 8):
+                    filename = f"{document.name}-0002-{region:02d}.png"
+                    (image_dir / filename).write_bytes(str(region).encode())
+                    text += f"![]({image_dir.as_posix()}/{filename})\n"
+                return [{"metadata": {"page_number": 2, "file_path": document.name}, "text": text}]
+
+            with mock.patch.object(extract_pdf.pymupdf4llm, "to_markdown", side_effect=fake_markdown), mock.patch.object(
+                extract_pdf.pymupdf4llm, "_use_layout", True
+            ):
+                chunks = extract_pdf.convert_pages(
+                    source, [1], image_dir=image_dir, write_images=True,
+                    use_ocr=False, force_ocr=False, ocr_language="eng", verbose=False,
+                )
+            self.assertEqual({p.name for p in image_dir.iterdir()}, {"0002-03.png", "0002-08.png"})
+            self.assertEqual((image_dir / "0002-03.png").read_bytes(), b"3")
+            self.assertEqual(chunks[0]["metadata"]["file_path"], str(source))
+            self.assertIn("![](images/0002-03.png)", chunks[0]["text"])
+            self.assertNotIn("pdf-reader.pdf", chunks[0]["text"])
+            page_text = extract_pdf.portable_markdown(chunks[0]["text"], image_dir, image_prefix="../images")
+            self.assertIn("![](../images/0002-08.png)", page_text)
+
+    def test_short_image_names_refuse_collisions_before_renaming(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            image_dir = Path(parent)
+            original = image_dir / "pdf-reader.pdf-0002-03.png"
+            original.write_bytes(b"original")
+            target = image_dir / "0002-03.png"
+            target.write_bytes(b"keep")
+            with self.assertRaises(ValueError):
+                extract_pdf.shorten_generated_image_names(image_dir)
+            self.assertEqual(original.read_bytes(), b"original")
+            self.assertEqual(target.read_bytes(), b"keep")
 
     def test_image_links_are_rewritten_out_of_temporary_directory(self) -> None:
         with tempfile.TemporaryDirectory() as parent:
@@ -374,10 +422,11 @@ class ExtractPdfTests(unittest.TestCase):
                 "pymupdf_native_text",
             )
 
-    def test_default_names_use_only_source_stem(self) -> None:
+    def test_default_output_names_use_source_stem_and_markdown_name_is_stable(self) -> None:
         first = Path("/tmp/source-a/report.pdf").resolve()
         second = Path("/tmp/source-b/report.pdf").resolve()
-        self.assertEqual(extract_pdf.markdown_filename(first), "report.md")
+        self.assertEqual(extract_pdf.markdown_filename(first), "document.md")
+        self.assertEqual(extract_pdf.markdown_filename(second), "document.md")
         first_name = extract_pdf.default_output_name(first)
         second_name = extract_pdf.default_output_name(second)
         self.assertEqual(first_name, "report")
@@ -390,6 +439,82 @@ class ExtractPdfTests(unittest.TestCase):
             extract_pdf.resolve_registry_file(first, target, None),
             first.parent / extract_pdf.REGISTRY_FILENAME,
         )
+
+    def test_windows_reserved_source_names_are_made_portable(self) -> None:
+        expected = {
+            "AUX-.pdf": "_AUX",
+            "[CON].pdf": "_CON",
+            "COM1-.pdf": "_COM1",
+            "normal.pdf": "normal",
+        }
+        for source, stem in expected.items():
+            with self.subTest(source=source):
+                path = Path(source)
+                self.assertEqual(extract_pdf.safe_stem(path), stem)
+                self.assertEqual(extract_pdf.markdown_filename(path), "document.md")
+
+    def test_invalid_registry_and_manifest_shapes_raise_value_error(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            registry_path = root / "registry.json"
+            for value in ([], {"schema_version": 1, "conversions": [None]}):
+                registry_path.write_text(json.dumps(value), encoding="utf-8")
+                with self.subTest(registry=value), self.assertRaises(ValueError):
+                    extract_pdf.load_registry(registry_path)
+
+            output = root / "output"
+            output.mkdir()
+            (output / "manifest.json").write_text("[]", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                extract_pdf.validate_replaceable_output(output)
+
+    def test_json_output_falls_back_to_ascii_for_legacy_windows_encoding(self) -> None:
+        class LegacyStream(io.StringIO):
+            @property
+            def encoding(self) -> str:
+                return "cp1252"
+
+        stream = LegacyStream()
+        value = {"status": "错误", "path": "中文目录"}
+        extract_pdf.emit_json(value, stream)
+        self.assertEqual(json.loads(stream.getvalue()), value)
+        self.assertTrue(stream.getvalue().isascii())
+
+    def test_explicit_tessdata_must_contain_every_requested_language(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            tessdata = Path(parent)
+            (tessdata / "eng.traineddata").write_bytes(b"test")
+            with mock.patch.dict(
+                extract_pdf.os.environ,
+                {"TESSDATA_PREFIX": str(tessdata)},
+                clear=False,
+            ):
+                self.assertEqual(
+                    extract_pdf.resolve_ocr_tessdata("eng"),
+                    tessdata.resolve(),
+                )
+                with self.assertRaises(RuntimeError):
+                    extract_pdf.resolve_ocr_tessdata("chi_sim+eng")
+
+    def test_registry_commit_reloads_and_merges_latest_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            registry_path = root / "registry.json"
+            first_source = root / "first.pdf"
+            second_source = root / "second.pdf"
+            first_identity = {"source": str(first_source), "output_dir": str(root / "one")}
+            second_identity = {"source": str(second_source), "output_dir": str(root / "two")}
+            extract_pdf.commit_registry_entry(
+                registry_path, "one", first_identity, root / "one", "first"
+            )
+            extract_pdf.commit_registry_entry(
+                registry_path, "two", second_identity, root / "two", "second"
+            )
+            registry = extract_pdf.load_registry(registry_path)
+            self.assertEqual(
+                {Path(item["source"]).name for item in registry["conversions"]},
+                {"first.pdf", "second.pdf"},
+            )
 
     def test_explicit_output_tag_is_normalized_and_appended(self) -> None:
         source = Path("/tmp/source/report.pdf").resolve()
@@ -487,6 +612,8 @@ class ExtractPdfTests(unittest.TestCase):
             self.assertFalse(first["already_converted"])
             self.assertTrue(second["already_converted"])
             self.assertEqual(second["status"], "already_converted")
+            self.assertEqual(Path(first["markdown"]).name, "document.md")
+            self.assertEqual(Path(second["markdown"]).name, "document.md")
             markdown = Path(second["markdown"]).read_text(encoding="utf-8")
             self.assertIn("<!-- page: 1 -->", markdown)
             manifest = json.loads(Path(second["manifest"]).read_text(encoding="utf-8"))
@@ -496,6 +623,7 @@ class ExtractPdfTests(unittest.TestCase):
                 extract_pdf.MANIFEST_SCHEMA_VERSION,
             )
             self.assertEqual(manifest["pages_processed"], 1)
+            self.assertEqual(manifest["markdown_file"], "document.md")
             self.assertIsNone(manifest["output_tag"])
             self.assertTrue(manifest["quality_passed"])
             self.assertEqual(len(manifest["page_extractions"]), 1)
@@ -748,6 +876,40 @@ class ExtractPdfTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 extract_pdf.extract_document(args)
             self.assertEqual(added.read_text(encoding="utf-8"), "keep me")
+
+    def test_activation_failure_restores_the_previous_output(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            output_dir = (root / "result").resolve()
+            args = argparse.Namespace(
+                pdf=str(DEMO_PDF),
+                output_dir=str(output_dir),
+                registry_file=str(root / "registry.json"),
+                reconvert=False,
+                pages="1",
+                images="none",
+                ocr="off",
+                ocr_language="eng",
+                no_page_files=False,
+                verbose=False,
+            )
+            first = extract_pdf.extract_document(args)
+            original = Path(first["markdown"]).read_bytes()
+            args.reconvert = True
+            real_rename = Path.rename
+
+            def fail_new_output_activation(path: Path, target: Path) -> Path:
+                if path.name.startswith(".test_pdf_read_script-") and Path(target) == output_dir:
+                    raise PermissionError("simulated activation failure")
+                return real_rename(path, target)
+
+            with mock.patch.object(Path, "rename", new=fail_new_output_activation):
+                with self.assertRaises(PermissionError):
+                    extract_pdf.extract_document(args)
+
+            self.assertTrue(output_dir.is_dir())
+            self.assertEqual(Path(first["markdown"]).read_bytes(), original)
+            self.assertFalse(list(root.glob(".test_pdf_read_script-*")))
 
 
 if __name__ == "__main__":

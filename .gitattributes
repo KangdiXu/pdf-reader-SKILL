@@ -1,0 +1,7 @@
+* text=auto
+.gitignore text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.cmd text eol=crlf
+transform_demo/pdf_2_md_demo text eol=lf

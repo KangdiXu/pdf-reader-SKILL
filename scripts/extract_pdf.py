@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import sys
@@ -15,7 +16,7 @@ import tempfile
 import time
 from collections import Counter
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 from urllib.parse import quote
 
@@ -31,10 +32,21 @@ OUTPUT_TAG_MAX_LENGTH = 48
 MANIFEST_SCHEMA_VERSION = 8
 REGISTRY_SCHEMA_VERSION = 1
 REGISTRY_FILENAME = "pdf-reader-conversions.json"
+COMBINED_MARKDOWN_FILENAME = "document.md"
+IMAGE_SOURCE_NAME = "pdf-reader.pdf"
 MARKDOWN_IMAGE_OPEN_RE = re.compile(r"!\[[^\]\n]*\]\(")
 PAGE_MARKER_RE = re.compile(r"<!--\s*page:\s*(\d+)\s*-->")
 HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 IGNORED_OUTPUT_FILE_NAMES = {".DS_Store"}
+WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "CLOCK$",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
 
 
 def validate_pdf(value: str | Path) -> Path:
@@ -180,9 +192,21 @@ def inspect_document(pdf_path: Path) -> dict[str, Any]:
         }
 
 
+def is_windows_reserved_name(value: str) -> bool:
+    """Return whether one path component is unusable as a Windows file name."""
+    normalized = value.rstrip(". ")
+    if not normalized:
+        return True
+    device_name = normalized.split(".", 1)[0].upper()
+    return device_name in WINDOWS_RESERVED_NAMES
+
+
 def safe_stem(path: Path) -> str:
-    stem = re.sub(r"[^0-9A-Za-z._\u4e00-\u9fff-]+", "-", path.stem).strip("-.")
-    return (stem or "document")[:80]
+    stem = re.sub(r"[^0-9A-Za-z._\u4e00-\u9fff-]+", "-", path.stem).strip("-. ")
+    stem = stem[:80].rstrip("-. ") or "document"
+    if is_windows_reserved_name(stem):
+        stem = f"_{stem}"[:80]
+    return stem
 
 
 def source_key(pdf_path: Path) -> str:
@@ -220,8 +244,8 @@ def default_output_name(pdf_path: Path, output_tag: str | None = None) -> str:
     ).name
 
 
-def markdown_filename(pdf_path: Path) -> str:
-    return f"{safe_stem(pdf_path)}.md"
+def markdown_filename(_pdf_path: Path) -> str:
+    return COMBINED_MARKDOWN_FILENAME
 
 
 def make_conversion_id(
@@ -247,6 +271,40 @@ def page_number(chunk: dict[str, Any]) -> int:
     return int(metadata.get("page_number", 0))
 
 
+class ImageExtractionDocument(pymupdf.Document):
+    """Open the source normally, but expose a short name to the image writer."""
+
+    @property
+    def name(self) -> str:
+        return IMAGE_SOURCE_NAME
+
+
+def shorten_generated_image_names(image_dir: Path) -> dict[str, str]:
+    """Keep backend page/region numbers and remove the short source prefix."""
+    if not image_dir.is_dir():
+        return {}
+    names = {}
+    use_layout = getattr(pymupdf4llm, "_use_layout", True)
+    pattern = re.compile(rf"{re.escape(IMAGE_SOURCE_NAME)}-(\d+)-(\d+)\.png")
+    for path in sorted(image_dir.iterdir()):
+        if not path.is_file():
+            continue
+        match = pattern.fullmatch(path.name)
+        if not match:
+            raise ValueError(f"无法识别图片的页码和数字区域编号: {path.name}")
+        page, region = map(int, match.groups())
+        # The legacy backend uses zero-based page numbers; layout uses one-based.
+        if not use_layout:
+            page += 1
+        target_name = f"{page:04d}-{region:02d}.png"
+        if target_name in names.values() or (image_dir / target_name).exists():
+            raise ValueError(f"图片名称冲突，拒绝覆盖: {target_name}")
+        names[path.name] = target_name
+    for original_name, target_name in names.items():
+        (image_dir / original_name).rename(image_dir / target_name)
+    return names
+
+
 def convert_pages(
     pdf_path: Path,
     pages: Iterable[int],
@@ -263,19 +321,32 @@ def convert_pages(
         return []
 
     library_output = io.StringIO()
-    with contextlib.redirect_stdout(library_output):
+    # The library derives saved image names from Document.name. A per-document
+    # wrapper avoids long filenames before the first save, without copying the PDF
+    # or changing the source file or any library-wide naming function.
+    with contextlib.redirect_stdout(library_output), ImageExtractionDocument(pdf_path) as document:
         chunks = pymupdf4llm.to_markdown(
-            pdf_path,
+            document,
             pages=page_list,
             page_chunks=True,
             page_separators=False,
             write_images=write_images,
             image_path=str(image_dir),
+            image_format="png",
             use_ocr=use_ocr,
             force_ocr=force_ocr,
             ocr_language=ocr_language,
             show_progress=False,
         )
+    image_names = shorten_generated_image_names(image_dir) if write_images else {}
+    for chunk in chunks:
+        metadata = chunk.get("metadata")
+        if isinstance(metadata, dict):
+            metadata["file_path"] = str(pdf_path)
+        if image_names:
+            chunk["text"] = portable_markdown(
+                chunk.get("text", ""), image_dir, image_name_map=image_names
+            )
     if verbose and library_output.getvalue():
         print(library_output.getvalue(), file=sys.stderr, end="")
     return chunks
@@ -290,18 +361,105 @@ def raster_ocr_page(
     """OCR an independent rasterized page so existing PDF text cannot interfere."""
     page_number_value = page_index + 1
     try:
+        tessdata = resolve_ocr_tessdata(language)
         pixmap = document[page_index].get_pixmap(
             dpi=OCR_DPI,
             colorspace=pymupdf.csRGB,
             alpha=False,
         )
-        ocr_pdf = pixmap.pdfocr_tobytes(language=language, compress=True)
+        ocr_pdf = pixmap.pdfocr_tobytes(
+            language=language,
+            compress=True,
+            tessdata=str(tessdata),
+        )
         with pymupdf.open(stream=ocr_pdf, filetype="pdf") as ocr_document:
             return ocr_document[0].get_text("text", sort=True).strip()
     except RuntimeError as exc:
         raise RuntimeError(
             f"PDF 第 {page_number_value} 页位图 OCR 失败: {exc}"
         ) from exc
+
+
+def _tessdata_languages(language: str) -> list[str]:
+    languages = [item.strip() for item in language.split("+") if item.strip()]
+    if not languages:
+        raise ValueError("OCR 语言不能为空")
+    if any(not re.fullmatch(r"[A-Za-z0-9_-]+", item) for item in languages):
+        raise ValueError(f"OCR 语言格式无效: {language}")
+    return languages
+
+
+def _usable_tessdata_directory(path: Path, languages: list[str]) -> Path | None:
+    for candidate in (path, path / "tessdata"):
+        if candidate.is_dir() and all(
+            (candidate / f"{item}.traineddata").is_file() for item in languages
+        ):
+            return candidate.resolve()
+    return None
+
+
+def resolve_ocr_tessdata(language: str) -> Path:
+    """Find one tessdata directory containing every requested OCR language."""
+    languages = _tessdata_languages(language)
+    explicit = os.environ.get("TESSDATA_PREFIX")
+    if explicit:
+        resolved = _usable_tessdata_directory(
+            Path(explicit).expanduser(), languages
+        )
+        if resolved:
+            return resolved
+        missing = ", ".join(f"{item}.traineddata" for item in languages)
+        raise RuntimeError(
+            "TESSDATA_PREFIX 未指向包含所需语言数据的目录: "
+            f"{explicit}；需要 {missing}"
+        )
+
+    candidates = [
+        Path(sys.prefix) / "share" / "tessdata",
+        Path(sys.prefix) / "share" / "tesseract-ocr" / "tessdata",
+        Path(sys.prefix) / "Library" / "share" / "tessdata",
+        Path(sys.prefix) / "Library" / "bin" / "tessdata",
+        Path(sys.prefix) / "tessdata",
+    ]
+    get_tessdata = getattr(pymupdf, "get_tessdata", None)
+    if callable(get_tessdata):
+        try:
+            detected = get_tessdata()
+        except (OSError, RuntimeError):
+            detected = None
+        if detected:
+            candidates.append(Path(detected))
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = os.path.normcase(str(candidate.expanduser().absolute()))
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved = _usable_tessdata_directory(candidate.expanduser(), languages)
+        if resolved:
+            return resolved
+
+    requested = ", ".join(f"{item}.traineddata" for item in languages)
+    raise RuntimeError(
+        "未找到可用的 OCR 语言数据。"
+        f"需要 {requested}；请安装语言文件并为当前终端设置 TESSDATA_PREFIX。"
+    )
+
+
+def check_ocr(language: str) -> dict[str, str]:
+    """Validate language data with a small in-memory Tesseract OCR operation."""
+    tessdata = resolve_ocr_tessdata(language)
+    with pymupdf.open() as document:
+        page = document.new_page(width=180, height=60)
+        page.insert_text((12, 35), "OCR test", fontsize=18)
+        pixmap = page.get_pixmap(dpi=150, colorspace=pymupdf.csRGB, alpha=False)
+        pixmap.pdfocr_tobytes(
+            language=language,
+            compress=True,
+            tessdata=str(tessdata),
+        )
+    return {"language": language, "tessdata": str(tessdata)}
 
 
 def markdown_unescape(value: str) -> str:
@@ -360,6 +518,7 @@ def rewrite_image_links_in_line(
     line: str,
     image_names: set[str],
     image_prefix: str,
+    image_name_map: dict[str, str] | None = None,
 ) -> str:
     search_from = 0
     while True:
@@ -394,7 +553,8 @@ def rewrite_image_links_in_line(
             candidates,
             key=lambda candidate: (candidate[0], -len(candidate[2])),
         )[1]
-        portable_target = f"{image_prefix.rstrip('/')}/{filename}"
+        target_name = image_name_map.get(filename, filename) if image_name_map else filename
+        portable_target = f"{image_prefix.rstrip('/')}/{target_name}"
         if any(character.isspace() for character in portable_target) or any(
             character in portable_target for character in "()"
         ):
@@ -408,6 +568,7 @@ def portable_markdown(
     image_dir: Path,
     *,
     image_prefix: str = "images",
+    image_name_map: dict[str, str] | None = None,
 ) -> str:
     """Rewrite generated image links so no temporary path survives."""
     image_names = (
@@ -415,9 +576,11 @@ def portable_markdown(
         if image_dir.exists()
         else set()
     )
+    if image_name_map:
+        image_names.update(image_name_map)
 
     rewritten = "".join(
-        rewrite_image_links_in_line(line, image_names, image_prefix)
+        rewrite_image_links_in_line(line, image_names, image_prefix, image_name_map)
         for line in text.splitlines(keepends=True)
     )
     return rewritten.strip() + "\n"
@@ -616,7 +779,26 @@ def resolve_output_dir(
         if value
         else (Path.cwd() / default_output_name(pdf_path)).resolve()
     )
-    return append_output_tag(base, normalized_tag)
+    result = append_output_tag(base, normalized_tag)
+    if value and os.name == "nt" and is_windows_reserved_name(result.name):
+        raise ValueError(f"--output-dir 使用了 Windows 保留名称: {result}")
+    return result
+
+
+def _validated_manifest_paths(value: Any, field: str, target: Path) -> set[str]:
+    if value is None and field == "generated_dirs":
+        return set()
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        raise ValueError(f"manifest.json 的 {field} 必须是字符串数组: {target}")
+    result = set()
+    for item in value:
+        path = PurePosixPath(item)
+        if path.is_absolute() or ".." in path.parts or str(path) in {"", "."}:
+            raise ValueError(f"manifest.json 的 {field} 包含无效路径: {item}")
+        result.add(path.as_posix())
+    return result
 
 
 def validate_replaceable_output(target: Path) -> dict[str, Any] | None:
@@ -637,10 +819,16 @@ def validate_replaceable_output(target: Path) -> dict[str, Any] | None:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"无法验证已有输出文件夹: {target}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(f"manifest.json 顶层必须是对象: {target}")
     if manifest.get("generator") != "pdf-reader":
         raise ValueError(f"输出文件夹不是 pdf-reader 生成的，拒绝覆盖: {target}")
-    expected_files = set(manifest.get("generated_files") or [])
-    expected_dirs = set(manifest.get("generated_dirs") or [])
+    expected_files = _validated_manifest_paths(
+        manifest.get("generated_files"), "generated_files", target
+    )
+    expected_dirs = _validated_manifest_paths(
+        manifest.get("generated_dirs"), "generated_dirs", target
+    )
     actual_files = {
         item.relative_to(target).as_posix()
         for item in target.rglob("*")
@@ -680,10 +868,21 @@ def load_registry(path: Path) -> dict[str, Any]:
         registry = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"转换登记 JSON 无法读取: {path}") from exc
+    if not isinstance(registry, dict):
+        raise ValueError(f"转换登记 JSON 顶层必须是对象: {path}")
     if registry.get("schema_version") != REGISTRY_SCHEMA_VERSION:
         raise ValueError(f"不支持的转换登记 JSON 版本: {path}")
-    if not isinstance(registry.get("conversions"), list):
+    conversions = registry.get("conversions")
+    if not isinstance(conversions, list):
         raise ValueError(f"转换登记 JSON 缺少 conversions 数组: {path}")
+    for index, entry in enumerate(conversions):
+        if not isinstance(entry, dict):
+            raise ValueError(f"转换登记 JSON 第 {index + 1} 项必须是对象: {path}")
+        for field in ("source", "output_dir"):
+            if not isinstance(entry.get(field), str) or not entry[field]:
+                raise ValueError(
+                    f"转换登记 JSON 第 {index + 1} 项的 {field} 必须是非空字符串: {path}"
+                )
     return registry
 
 
@@ -707,6 +906,55 @@ def write_registry(path: Path, registry: dict[str, Any]) -> None:
             Path(temp_name).unlink()
 
 
+@contextlib.contextmanager
+def exclusive_file_lock(path: Path, timeout: float = 60.0) -> Iterable[None]:
+    """Acquire a small cross-platform advisory lock file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write(b"0")
+        handle.flush()
+    deadline = time.monotonic() + timeout
+    locked = False
+    try:
+        while not locked:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"等待文件锁超时: {path}")
+                time.sleep(0.05)
+        yield
+    finally:
+        if locked:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def lock_file_for(*values: Path | str) -> Path:
+    key = "\0".join(os.path.normcase(str(value)) for value in values).encode("utf-8")
+    digest = hashlib.sha256(key).hexdigest()
+    return Path(tempfile.gettempdir()) / "pdf-reader-locks" / f"{digest}.lock"
+
+
 def same_source(value: Any, pdf_path: Path) -> bool:
     if not isinstance(value, str) or not value:
         return False
@@ -714,14 +962,25 @@ def same_source(value: Any, pdf_path: Path) -> bool:
 
 
 def manifest_markdown_path(output_dir: Path, manifest: dict[str, Any]) -> Path:
+    if not isinstance(manifest, dict):
+        raise ValueError(f"manifest.json 顶层必须是对象: {output_dir}")
     markdown_file = manifest.get("markdown_file")
     if isinstance(markdown_file, str) and markdown_file:
-        return output_dir / markdown_file
-    legacy = output_dir / "document.md"
-    if legacy.is_file():
-        return legacy
+        path = PurePosixPath(markdown_file)
+        if not path.is_absolute() and ".." not in path.parts:
+            return output_dir / Path(*path.parts)
+        raise ValueError(f"manifest.json 的 markdown_file 路径无效: {output_dir}")
+    default = output_dir / COMBINED_MARKDOWN_FILENAME
+    if default.is_file():
+        return default
     generated = manifest.get("generated_files") or []
+    if not isinstance(generated, list):
+        raise ValueError(f"manifest.json 的 generated_files 必须是数组: {output_dir}")
     for relative in generated:
+        if not isinstance(relative, str):
+            raise ValueError(
+                f"manifest.json 的 generated_files 必须是字符串数组: {output_dir}"
+            )
         path = Path(relative)
         if len(path.parts) == 1 and path.suffix.lower() == ".md":
             return output_dir / path
@@ -768,13 +1027,19 @@ def registered_output_quality_is_valid(
         return False
     extraction_records = manifest.get("page_extractions")
     if isinstance(extraction_records, list) and extraction_records:
-        return all(record.get("quality_passed") is not False for record in extraction_records)
+        if not all(isinstance(record, dict) for record in extraction_records):
+            return False
+        return all(
+            record.get("quality_passed") is not False
+            for record in extraction_records
+        )
 
     try:
         page_texts = output_page_texts(output_dir, manifest)
-        selected_pages = (manifest.get("parameters") or {}).get("pages") or sorted(
-            page_texts
-        )
+        parameters = manifest.get("parameters") or {}
+        if not isinstance(parameters, dict):
+            return False
+        selected_pages = parameters.get("pages") or sorted(page_texts)
         if not isinstance(selected_pages, list) or not selected_pages:
             return False
         with pymupdf.open(pdf_path) as document:
@@ -870,10 +1135,56 @@ def upsert_registry_entry(
     )
 
 
+def commit_registry_entry(
+    path: Path,
+    conversion_id: str,
+    identity: dict[str, Any],
+    target: Path,
+    generated_at: str,
+) -> dict[str, Any]:
+    """Merge one entry into the latest registry while holding its lock."""
+    with exclusive_file_lock(lock_file_for("registry", path)):
+        registry = load_registry(path)
+        upsert_registry_entry(
+            registry, conversion_id, identity, target, generated_at
+        )
+        write_registry(path, registry)
+    return registry_entry(conversion_id, identity, target, generated_at)
+
+
 def extract_document(args: argparse.Namespace) -> dict[str, Any]:
-    started = time.perf_counter()
     pdf_path = validate_pdf(args.pdf)
     output_tag = normalize_output_tag(getattr(args, "output_tag", None))
+    target = resolve_output_dir(pdf_path, args.output_dir, output_tag)
+    registry_path = resolve_registry_file(pdf_path, target, args.registry_file)
+    lock_paths = sorted(
+        {
+            lock_file_for("source", pdf_path),
+            lock_file_for("target", target),
+        },
+        key=str,
+    )
+    with contextlib.ExitStack() as stack:
+        for lock_path in lock_paths:
+            stack.enter_context(exclusive_file_lock(lock_path, timeout=300.0))
+        return _extract_document_locked(
+            args,
+            pdf_path=pdf_path,
+            output_tag=output_tag,
+            target=target,
+            registry_path=registry_path,
+        )
+
+
+def _extract_document_locked(
+    args: argparse.Namespace,
+    *,
+    pdf_path: Path,
+    output_tag: str | None,
+    target: Path,
+    registry_path: Path,
+) -> dict[str, Any]:
+    started = time.perf_counter()
     requested_options = {
         "pages": args.pages or "all",
         "images": args.images,
@@ -882,8 +1193,6 @@ def extract_document(args: argparse.Namespace) -> dict[str, Any]:
         "page_files": not args.no_page_files,
         "output_tag": output_tag,
     }
-    target = resolve_output_dir(pdf_path, args.output_dir, output_tag)
-    registry_path = resolve_registry_file(pdf_path, target, args.registry_file)
     registry = load_registry(registry_path)
     registered = (
         None
@@ -936,12 +1245,11 @@ def extract_document(args: argparse.Namespace) -> dict[str, Any]:
                 "parameters": registered_parameters,
             }
             generated_at = str(existing_manifest.get("generated_at", ""))
-            upsert_registry_entry(
-                registry, conversion_id, identity, target, generated_at
+            committed_entry = commit_registry_entry(
+                registry_path, conversion_id, identity, target, generated_at
             )
-            write_registry(registry_path, registry)
             registered = (
-                registry_entry(conversion_id, identity, target, generated_at),
+                committed_entry,
                 existing_manifest,
             )
     if registered:
@@ -1076,21 +1384,59 @@ def extract_document(args: argparse.Namespace) -> dict[str, Any]:
         )
 
         validate_replaceable_output(target)
-        if target.exists():
-            shutil.rmtree(target)
-        temp_path.rename(target)
     except Exception:
         shutil.rmtree(temp_path, ignore_errors=True)
         raise
 
-    upsert_registry_entry(
-        registry,
-        conversion_id,
-        identity,
-        target,
-        manifest["generated_at"],
-    )
-    write_registry(registry_path, registry)
+    backup_path: Path | None = None
+    if target.exists():
+        backup_path = target.with_name(
+            f".{target.name}.backup-{os.getpid()}-{time.time_ns()}"
+        )
+        try:
+            target.rename(backup_path)
+        except Exception:
+            shutil.rmtree(temp_path, ignore_errors=True)
+            raise
+    try:
+        temp_path.rename(target)
+    except Exception:
+        if backup_path and backup_path.exists() and not target.exists():
+            try:
+                backup_path.rename(target)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "激活新输出失败，且旧输出回滚失败；"
+                    f"旧输出备份保留在: {backup_path}"
+                ) from rollback_error
+        shutil.rmtree(temp_path, ignore_errors=True)
+        raise
+
+    try:
+        commit_registry_entry(
+            registry_path,
+            conversion_id,
+            identity,
+            target,
+            manifest["generated_at"],
+        )
+    except Exception:
+        if backup_path and backup_path.exists():
+            failed_output = target.with_name(
+                f".{target.name}.failed-{os.getpid()}-{time.time_ns()}"
+            )
+            try:
+                target.rename(failed_output)
+                backup_path.rename(target)
+                shutil.rmtree(failed_output, ignore_errors=True)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "登记转换结果失败，且旧输出回滚失败；"
+                    f"旧输出备份保留在: {backup_path}"
+                ) from rollback_error
+        raise
+    if backup_path and backup_path.exists():
+        shutil.rmtree(backup_path)
 
     return {
         "status": "ok",
@@ -1165,7 +1511,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def configure_standard_streams() -> None:
+    """Prefer UTF-8 for Windows consoles and redirected standard streams."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8")
+            except (OSError, ValueError):
+                pass
+
+
+def emit_json(value: Any, stream: Any, *, indent: int | None = None) -> None:
+    """Write exactly one complete JSON value, escaping when the stream needs it."""
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    rendered = json.dumps(value, ensure_ascii=False, indent=indent)
+    try:
+        rendered.encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        rendered = json.dumps(value, ensure_ascii=True, indent=indent)
+    stream.write(rendered + "\n")
+
+
 def main() -> int:
+    configure_standard_streams()
     parser = build_parser()
     args = parser.parse_args()
     try:
@@ -1175,10 +1544,10 @@ def main() -> int:
                 result.pop("pages", None)
         else:
             result = extract_document(args)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        emit_json(result, sys.stdout, indent=2)
         return 0
     except (OSError, ValueError, RuntimeError) as exc:
-        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        emit_json({"status": "error", "error": str(exc)}, sys.stderr)
         return 2
 
 

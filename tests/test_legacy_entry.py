@@ -36,6 +36,12 @@ class LegacyEntryTests(unittest.TestCase):
         values = ["transfer", "input.pdf", "--force"]
         self.assertEqual(pdf_2_md_main.translate_args(values), values)
 
+    def test_legacy_empty_output_placeholder_is_discarded(self) -> None:
+        self.assertEqual(
+            pdf_2_md_main.translate_args(["input.pdf", "", "--force"]),
+            ["extract", "input.pdf", "--force"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

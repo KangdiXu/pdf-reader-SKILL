@@ -10,15 +10,21 @@ macOS/Linux：
 bash install_pdf_read_env.sh
 ```
 
-Windows：
+Windows x64（在 Miniconda Prompt、Anaconda Prompt 或可找到 `conda` 的 CMD 中运行）：
 
 ```bat
 install_pdf_read_env.cmd
 ```
 
-安装程序会创建或复用名为 `pdf_read` 的 Conda 环境，并把 `SKILL.md`、本手册、提取脚本和 OCR 指南安装到所选 AI agent。
+安装程序会创建或复用名为 `pdf_read` 的 Conda 环境，并把运行所需文件安装到所选 AI agent。新环境使用 Python 3.12；已有环境必须使用 Python 3.10 或更高版本。Windows 依赖当前支持运行 `win-amd64` Python 的 Windows x64 环境（包括可运行 x64 Python 的 ARM Windows），不支持 Windows 32 位或原生 ARM64 Python。
 
-本手册中的底层命令假设当前工作目录是 `pdf-reader`。如果从其他目录执行，请把 `scripts/extract_pdf.py` 和 `pdf_2_md_main.py` 替换为实际安装位置下的绝对路径。
+基础 PDF 转换和 OCR 会分别检查。缺少 Tesseract 语言数据不会阻止基础安装，但安装器会分别报告英文 OCR 和中英文 OCR 的状态；配置方法见 [references/ocr.md](references/ocr.md)。覆盖已有 skill 时，两套安装器都会先暂存并校验完整副本，再备份、替换；激活或校验失败会恢复旧版本。
+
+本手册中的底层命令假设当前工作目录是 `pdf-reader`。如果从其他目录执行，请把 `scripts/extract_pdf.py` 和 `pdf_2_md_main.py` 替换为实际安装位置下的绝对路径。命令均使用双引号；macOS/Linux 路径示例形如 `/Users/me/...`，Windows 请换成形如 `C:\Users\me\...` 的路径。Windows 示例：
+
+```bat
+conda run --no-capture-output -n pdf_read python "scripts\extract_pdf.py" inspect "C:\Users\me\Documents\report.pdf"
+```
 
 ## 如何向 Codex 使用这个 skill
 
@@ -96,13 +102,15 @@ OCR 语言：无需
 
 ```text
 /Users/me/Documents/report-output/
-├── report.md
+├── document.md
 ├── manifest.json
 ├── pages/
 └── images/       # 仅按需存在
 ```
 
 所有提取图片最终都保存在结果文件夹的 `images/` 中。合并 Markdown 使用 `images/<图片文件名>`，逐页 Markdown 使用 `../images/<图片文件名>`，因此两者都能正确定位同一个最终图片文件。输出内容不会保留 `.临时目录/.../images/` 路径。复用旧转换结果时，skill 会自动修正历史 Markdown 中残留的临时图片路径，无需重新解析 PDF。
+
+新转换的图片统一命名为 `<PDF页码>-<页面布局区域编号>.png`，例如 `0002-03.png`。PDF 页码从 1 开始，至少四位、补零；布局区域编号从 0 开始，至少两位、补零，保留提取器的原始编号。区域也包括文字等内容，因此图片编号可能跳号，不代表论文的 Figure 编号。图片名称不包含源 PDF 文件名，也不随输出目录名称或 tag 变化。已有转换结果仍可按原名称复用；需要采用新图片名称时，显式使用 `--reconvert`。
 
 如果没有提供 `--output-dir`，默认在当前工作目录创建只使用 PDF 文件名的结果文件夹：
 
@@ -187,8 +195,7 @@ Skill 处理方法：只运行快速检查，不执行布局分析、图片提�
 底层命令：
 
 ```bash
-conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
-  inspect "/Users/me/Documents/report.pdf"
+conda run --no-capture-output -n pdf_read python "scripts/extract_pdf.py" inspect "/Users/me/Documents/report.pdf"
 ```
 
 输出结果：终端返回 JSON，包括 `page_count`、`text_chars`、`image_count`、`likely_scanned_pages`、`hidden_ocr_pages`、文档元数据和目录；使用 `--include-pages` 时还会给出透明/可见文本 span 与字符数、`ignore-text` / `fill-text` / `fill-image` 计数和最大图片页面占比。检查不会创建结果文件夹。
@@ -211,12 +218,10 @@ Skill 处理方法：先检查 PDF，然后提取全部页面文字；默认不�
 底层命令：
 
 ```bash
-conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
-  extract "/Users/me/Documents/paper.pdf" \
-  --output-dir "/Users/me/Documents/paper-output"
+conda run --no-capture-output -n pdf_read python "scripts/extract_pdf.py" extract "/Users/me/Documents/paper.pdf" --output-dir "/Users/me/Documents/paper-output"
 ```
 
-输出结果：`paper-output/` 直接包含合并全文 `paper.md`、逐页文件 `pages/*.md` 和处理信息 `manifest.json`。Codex 根据这些文件生成带页码的总结。
+输出结果：`paper-output/` 直接包含合并全文 `document.md`、逐页文件 `pages/*.md` 和处理信息 `manifest.json`。合并全文始终使用固定名称 `document.md`，不随源 PDF 或输出文件夹名称变化。Codex 根据这些文件生成带页码的总结。
 
 ## 场景三：在长文档中查找一个具体问题
 
@@ -236,10 +241,7 @@ Skill 处理方法：先检查目录；如果无法直接确定页码，则生�
 底层命令：
 
 ```bash
-conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
-  extract "/Users/me/Documents/device-manual.pdf" \
-  --output-dir "/Users/me/Documents/manual-output" \
-  --images none
+conda run --no-capture-output -n pdf_read python "scripts/extract_pdf.py" extract "/Users/me/Documents/device-manual.pdf" --output-dir "/Users/me/Documents/manual-output" --images none
 ```
 
 然后搜索分页文件：
@@ -267,13 +269,10 @@ Skill 处理方法：只解析第 35–52 页，避免处理文档其余部分�
 底层命令：
 
 ```bash
-conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
-  extract "/Users/me/Documents/book.pdf" \
-  --output-dir "/Users/me/Documents/chapter-output" \
-  --pages "35-52"
+conda run --no-capture-output -n pdf_read python "scripts/extract_pdf.py" extract "/Users/me/Documents/book.pdf" --output-dir "/Users/me/Documents/chapter-output" --pages "35-52"
 ```
 
-输出结果：`book.md` 和 `pages/` 只包含指定页面，`manifest.json` 记录处理参数和实际页数。
+输出结果：`document.md` 和 `pages/` 只包含指定页面，`manifest.json` 记录处理参数和实际页数。
 
 ## 场景五：分析图表、公式或页面版式
 
@@ -292,11 +291,7 @@ Skill 处理方法：只处理指定页，同时提取这些页面中的图片�
 底层命令：
 
 ```bash
-conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
-  extract "/Users/me/Documents/experiment.pdf" \
-  --output-dir "/Users/me/Documents/figure-output" \
-  --pages "12-15" \
-  --images selected
+conda run --no-capture-output -n pdf_read python "scripts/extract_pdf.py" extract "/Users/me/Documents/experiment.pdf" --output-dir "/Users/me/Documents/figure-output" --pages "12-15" --images selected
 ```
 
 输出结果：除 Markdown 和清单外，还生成 `images/`。Markdown 使用相对图片路径，因此整个输出文件夹可以移动。
@@ -318,11 +313,7 @@ Skill 处理方法：关闭 Tesseract OCR，运行布局提取并执行原生文
 底层命令：
 
 ```bash
-conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
-  extract "/Users/me/Documents/specification.pdf" \
-  --output-dir "/Users/me/Documents/spec-output" \
-  --pages "20-40" \
-  --ocr off
+conda run --no-capture-output -n pdf_read python "scripts/extract_pdf.py" extract "/Users/me/Documents/specification.pdf" --output-dir "/Users/me/Documents/spec-output" --pages "20-40" --ocr off
 ```
 
 输出结果：生成指定页面的 Markdown，不进行昂贵的页面 OCR。这通常是最快的提取模式。
@@ -345,12 +336,7 @@ Skill 处理方法：先把每个指定页面渲染成独立位图，再交给 T
 底层命令：
 
 ```bash
-conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
-  extract "/Users/me/Documents/scanned-contract.pdf" \
-  --output-dir "/Users/me/Documents/contract-output" \
-  --pages "1-8" \
-  --ocr force \
-  --ocr-language "chi_sim+eng"
+conda run --no-capture-output -n pdf_read python "scripts/extract_pdf.py" extract "/Users/me/Documents/scanned-contract.pdf" --output-dir "/Users/me/Documents/contract-output" --pages "1-8" --ocr force --ocr-language "chi_sim+eng"
 ```
 
 输出结果：生成 OCR 后的 Markdown 和分页文件。OCR 语言是否可用取决于本机安装情况；关键姓名、数字和公式仍应与页面图像核对。
@@ -372,10 +358,7 @@ Skill 处理方法：保留默认的 `--ocr auto`。脚本同时检查原生文�
 底层命令：
 
 ```bash
-conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
-  extract "/Users/me/Documents/mixed-report.pdf" \
-  --output-dir "/Users/me/Documents/mixed-output" \
-  --ocr auto
+conda run --no-capture-output -n pdf_read python "scripts/extract_pdf.py" extract "/Users/me/Documents/mixed-report.pdf" --output-dir "/Users/me/Documents/mixed-output" --ocr auto
 ```
 
 输出结果：正常页面、原生文本回退页面和 OCR 页面按照原页码重新合并；`manifest.json` 记录 `likely_scanned_pages`、`hidden_ocr_pages` 和每页实际后端。
@@ -397,11 +380,7 @@ Skill 处理方法：提取目标页面文本和图片，Codex交叉检查表格
 底层命令：
 
 ```bash
-conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
-  extract "/Users/me/Documents/financial-report.pdf" \
-  --output-dir "/Users/me/Documents/table-output" \
-  --pages "72-75" \
-  --images selected
+conda run --no-capture-output -n pdf_read python "scripts/extract_pdf.py" extract "/Users/me/Documents/financial-report.pdf" --output-dir "/Users/me/Documents/table-output" --pages "72-75" --images selected
 ```
 
 输出结果：目标页 Markdown、逐页文件、表格或页面图片和处理清单。最终答案应逐项标注 PDF 页码，并说明无法可靠辨认的数据。
@@ -429,10 +408,7 @@ Skill 处理方法：转换全部页面，保留合并文件和逐页文件，�
 底层命令：
 
 ```bash
-conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
-  transfer "/Users/me/Documents/guide.pdf" \
-  --output-dir "/Users/me/Documents/guide-output" \
-  --images none
+conda run --no-capture-output -n pdf_read python "scripts/extract_pdf.py" transfer "/Users/me/Documents/guide.pdf" --output-dir "/Users/me/Documents/guide-output" --images none
 ```
 
 如果只需要一个 Markdown 文件，可以增加：
@@ -441,7 +417,7 @@ conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
 --no-page-files
 ```
 
-输出结果：默认生成 `guide.md`、`pages/` 和 `manifest.json`；使用 `--no-page-files` 时不生成 `pages/`。Codex 只报告这些路径和处理页数，不总结 PDF。
+输出结果：默认生成 `document.md`、`pages/` 和 `manifest.json`；使用 `--no-page-files` 时不生成 `pages/`。Codex 只报告这些路径和处理页数，不总结 PDF。
 
 ## 场景十一：source 已经转换过
 
@@ -485,20 +461,24 @@ Skill 处理方法：默认枚举 `reports/` 第一层中的所有 PDF，不递�
 
 枚举第一层 PDF 的底层命令：
 
+macOS/Linux（`rg` 需要另行安装）：
+
 ```bash
-rg --files --max-depth 1 -g '*.pdf' -g '*.PDF' "/Users/me/Documents/reports"
+rg --files --max-depth 1 -g "*.pdf" -g "*.PDF" "/Users/me/Documents/reports"
 ```
 
-如果用户明确要求递归处理，则去掉 `--max-depth 1`。
+Windows PowerShell（无需 `rg`）：
+
+```powershell
+Get-ChildItem -LiteralPath "C:\Users\me\Documents\reports" -File | Where-Object { $_.Extension -ieq ".pdf" } | Select-Object -ExpandProperty FullName
+```
+
+如果用户明确要求递归处理，Bash 命令去掉 `--max-depth 1`；PowerShell 命令增加 `-Recurse`。
 
 对其中 `annual-report.pdf` 执行的底层命令示例：
 
 ```bash
-conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
-  extract "/Users/me/Documents/reports/annual-report.pdf" \
-  --output-dir "/Users/me/Documents/reports-output/annual-report" \
-  --images none \
-  --ocr off
+conda run --no-capture-output -n pdf_read python "scripts/extract_pdf.py" extract "/Users/me/Documents/reports/annual-report.pdf" --output-dir "/Users/me/Documents/reports-output/annual-report" --images none --ocr off
 ```
 
 其他 PDF 使用相同参数逐份执行。输出根目录中的每个 PDF 结果互相独立；默认登记文件位于源目录 `/Users/me/Documents/reports/pdf-reader-conversions.json`。
@@ -517,14 +497,7 @@ conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
 对应底层命令使用 `--reconvert` 或同义别名 `--force`：
 
 ```bash
-conda run --no-capture-output -n pdf_read python scripts/extract_pdf.py \
-  transfer "/Users/me/Documents/report.pdf" \
-  --output-dir "/Users/me/Documents/report-output" \
-  --pages "2" \
-  --images selected \
-  --ocr force \
-  --ocr-language "chi_sim" \
-  --reconvert
+conda run --no-capture-output -n pdf_read python "scripts/extract_pdf.py" transfer "/Users/me/Documents/report.pdf" --output-dir "/Users/me/Documents/report-output" --pages "2" --images selected --ocr force --ocr-language "chi_sim" --reconvert
 ```
 
 这会跳过 source 重复记录，按照本次参数重新生成结果并更新该 source 的登记项。仅改变参数不会自动触发重新生成。
@@ -557,7 +530,7 @@ Documents/
 ├── report.pdf                   # source
 ├── pdf-reader-conversions.json  # 按 source 去重的登记表
 └── report/
-    ├── report.md                # 合并后的 Markdown，含 PDF 页码标记
+    ├── document.md              # 合并后的 Markdown，含 PDF 页码标记
     ├── manifest.json            # 当前输出文件夹的完整说明
     ├── pages/
     │   ├── 0001.md              # 单页 Markdown，便于搜索和选择性读取
@@ -572,7 +545,7 @@ Documents/
   "status": "ok",
   "already_converted": false,
   "output_dir": "/Users/me/Documents/report-output",
-  "markdown": "/Users/me/Documents/report-output/report.md",
+  "markdown": "/Users/me/Documents/report-output/document.md",
   "manifest": "/Users/me/Documents/report-output/manifest.json",
   "registry": "/Users/me/Documents/pdf-reader-conversions.json",
   "conversion_id": "...",
@@ -592,7 +565,7 @@ Documents/
   "message": "该 source 已转换过；未重新转换。结果位于: /Users/me/Documents/report-output",
   "output_dir": "/Users/me/Documents/report-output",
   "requested_output_dir": "/Users/me/Documents/new-output",
-  "markdown": "/Users/me/Documents/report-output/report.md",
+  "markdown": "/Users/me/Documents/report-output/document.md",
   "manifest": "/Users/me/Documents/report-output/manifest.json",
   "registry": "/Users/me/Documents/pdf-reader-conversions.json",
   "conversion_id": "...",
@@ -628,7 +601,7 @@ Documents/
 - `pymupdf_version`、`pymupdf4llm_version`：解析器版本
 - `parameters`：本次转换使用的全部参数
 - `output_tag`：用户显式要求并规范化后的英文 tag；未要求时为 `null`
-- `markdown_file`：按源文件名生成的合并 Markdown 文件名
+- `markdown_file`：合并 Markdown 文件名；新转换统一为 `document.md`
 - `pages_processed`：实际处理页数
 - `likely_scanned_pages`：探测到的疑似扫描页
 - `hidden_ocr_pages`：检测到“整页图片 + 透明 OCR 文字层”的页面
@@ -644,10 +617,7 @@ Documents/
 旧入口仍然有效：
 
 ```bash
-conda run --no-capture-output -n pdf_read python pdf_2_md_main.py \
-  "/Users/me/Documents/input.pdf" \
-  "/Users/me/Documents/report-output" \
-  --force
+conda run --no-capture-output -n pdf_read python "pdf_2_md_main.py" "/Users/me/Documents/input.pdf" "/Users/me/Documents/report-output" --force
 ```
 
 它会转发到新版 `extract` 命令，并保留输出目录后面的 `--pages`、`--images`、`--ocr`、`--reconvert` 或 `--force` 等选项。新代码和新文档应优先直接使用 `scripts/extract_pdf.py transfer`。不要对同一个请求同时运行两个入口。

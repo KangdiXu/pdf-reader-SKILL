@@ -24,7 +24,9 @@ def translate_args(values: list[str]) -> list[str]:
     if args and args[0] not in known_commands:
         legacy = ["extract", args[0]]
         remaining = args[1:]
-        if remaining and remaining[0] and not remaining[0].startswith("-"):
+        if remaining and not remaining[0]:
+            remaining.pop(0)
+        elif remaining and not remaining[0].startswith("-"):
             legacy.extend(["--output-dir", remaining.pop(0)])
         legacy.extend(remaining)
         args = legacy

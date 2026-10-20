@@ -877,6 +877,62 @@ class ExtractPdfTests(unittest.TestCase):
                 extract_pdf.extract_document(args)
             self.assertEqual(added.read_text(encoding="utf-8"), "keep me")
 
+    def test_short_transaction_names_preserve_colliding_outputs(self) -> None:
+        fixed_ns = 1_791_724_000_123_456_789
+        fixed_time = extract_pdf.time.struct_time((2026, 10, 11, 21, 5, 7, 6, 284, -1))
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            for role in ("backup", "failed"):
+                first_source = root / "abcdefghijk"
+                second_source = root / "abcdefghijl"
+                first_source.mkdir()
+                second_source.mkdir()
+                (first_source / "content").write_bytes(b"first")
+                (second_source / "content").write_bytes(b"second")
+                with mock.patch.object(extract_pdf.time, "time_ns", return_value=fixed_ns), \
+                     mock.patch.object(extract_pdf.time, "localtime", return_value=fixed_time), \
+                     mock.patch.object(extract_pdf.os, "getpid", return_value=12345):
+                    first = extract_pdf.move_output_aside(first_source, role)
+                    second = extract_pdf.move_output_aside(second_source, role)
+                self.assertEqual(first.name, f".abcdefghij.{role}-12345-210507123456789")
+                self.assertEqual(second.name, first.name + "-1")
+                self.assertEqual((first / "content").read_bytes(), b"first")
+                self.assertEqual((second / "content").read_bytes(), b"second")
+
+    def test_long_output_name_can_be_reconverted_and_rolled_back(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            output_dir = root / ("a" * 240)
+            try:
+                output_dir.mkdir()
+            except OSError as exc:
+                self.skipTest(f"Filesystem does not support this long test path: {exc}")
+            args = argparse.Namespace(
+                pdf=str(DEMO_PDF),
+                output_dir=str(output_dir),
+                registry_file=str(root / "registry.json"),
+                reconvert=False,
+                pages="1",
+                images="none",
+                ocr="off",
+                ocr_language="eng",
+                no_page_files=False,
+                verbose=False,
+            )
+            extract_pdf.extract_document(args)
+            args.reconvert = True
+            self.assertEqual(extract_pdf.extract_document(args)["status"], "ok")
+            original_manifest = (output_dir / "manifest.json").read_bytes()
+            original_markdown = (output_dir / "document.md").read_bytes()
+            with mock.patch.object(
+                extract_pdf, "commit_registry_entry", side_effect=PermissionError("simulated registry failure")
+            ):
+                with self.assertRaises(PermissionError):
+                    extract_pdf.extract_document(args)
+            self.assertEqual((output_dir / "manifest.json").read_bytes(), original_manifest)
+            self.assertEqual((output_dir / "document.md").read_bytes(), original_markdown)
+            self.assertEqual({item.name for item in root.iterdir()}, {output_dir.name, "registry.json"})
+
     def test_activation_failure_restores_the_previous_output(self) -> None:
         with tempfile.TemporaryDirectory() as parent:
             root = Path(parent)

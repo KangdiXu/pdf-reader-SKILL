@@ -10,6 +10,8 @@ pdf-reader-conversions.json
 /transform_demo/.test_pdf_read_script-*/
 /transform_demo/.test_pdf_read_script.backup-*/
 /transform_demo/.test_pdf_read_script.failed-*/
+/transform_demo/.test_pdf_r.backup-*/
+/transform_demo/.test_pdf_r.failed-*/
 
 # Local compatibility-audit notes; not part of the distributable skill.
 /检查 pdf-reader 的 Windows 兼容性的对话-修改skill repo-261009.md

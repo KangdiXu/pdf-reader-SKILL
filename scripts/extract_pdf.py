@@ -955,6 +955,22 @@ def lock_file_for(*values: Path | str) -> Path:
     return Path(tempfile.gettempdir()) / "pdf-reader-locks" / f"{digest}.lock"
 
 
+def move_output_aside(target: Path, role: str) -> Path:
+    """Move output to a short sibling, without replacing an existing backup."""
+    with exclusive_file_lock(lock_file_for("transaction-names", target.parent)):
+        now_ns = time.time_ns()
+        timestamp = time.strftime("%H%M%S", time.localtime(now_ns // 1_000_000_000))
+        timestamp += f"{now_ns % 1_000_000_000:09d}"
+        name = f".{target.name[:10]}.{role}-{os.getpid()}-{timestamp}"
+        destination = target.with_name(name)
+        suffix = 0
+        while os.path.lexists(destination):
+            suffix += 1
+            destination = target.with_name(f"{name}-{suffix}")
+        target.rename(destination)
+        return destination
+
+
 def same_source(value: Any, pdf_path: Path) -> bool:
     if not isinstance(value, str) or not value:
         return False
@@ -1390,11 +1406,8 @@ def _extract_document_locked(
 
     backup_path: Path | None = None
     if target.exists():
-        backup_path = target.with_name(
-            f".{target.name}.backup-{os.getpid()}-{time.time_ns()}"
-        )
         try:
-            target.rename(backup_path)
+            backup_path = move_output_aside(target, "backup")
         except Exception:
             shutil.rmtree(temp_path, ignore_errors=True)
             raise
@@ -1422,11 +1435,8 @@ def _extract_document_locked(
         )
     except Exception:
         if backup_path and backup_path.exists():
-            failed_output = target.with_name(
-                f".{target.name}.failed-{os.getpid()}-{time.time_ns()}"
-            )
             try:
-                target.rename(failed_output)
+                failed_output = move_output_aside(target, "failed")
                 backup_path.rename(target)
                 shutil.rmtree(failed_output, ignore_errors=True)
             except Exception as rollback_error:

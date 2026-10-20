@@ -213,7 +213,7 @@ SKILL_TARGET="$SKILLS_DIR/$SKILL_NAME"
 
 echo
 if [ -d "$SKILL_TARGET" ]; then
-    echo "[提示] $AGENT_NAME 已安装 $SKILL_NAME：\"$SKILL_TARGET\""
+    echo "[提示] $AGENT_NAME 已安装 ${SKILL_NAME}：\"$SKILL_TARGET\""
     if ! IFS= read -r -p "  是否覆盖？[y/N] " confirm; then
         echo "[取消] 输入已结束，未安装 skill。"
         exit 0
